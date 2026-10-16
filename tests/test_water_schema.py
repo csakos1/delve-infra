@@ -6,7 +6,7 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone
 
-PLUGIN = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/.hermes/plugins/agentcards")
+PLUGIN = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hermes", "plugins", "agentcards")
 sys.path.insert(0, PLUGIN)
 import schemas  # noqa: E402
 

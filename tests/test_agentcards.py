@@ -2,7 +2,7 @@
 import json, os, stat, sys, tempfile
 from datetime import datetime, timedelta, timezone
 
-sys.path.insert(0, os.path.expanduser("~/.hermes/plugins/agentcards"))
+sys.path.insert(0, os.environ.get("AGENTCARDS_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hermes", "plugins", "agentcards"))
 import schemas, store  # noqa: E402
 
 now = datetime.now(timezone.utc)

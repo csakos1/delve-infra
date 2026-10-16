@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """Offline teszt a water_level.py parszolójához.
-Használat: python3 test_water_level.py [water_level.py útvonal] [tohid.html fixture]
-"""
-import importlib.util
-import os
-import sys
+Használat: python3 -I tests/test_water_level.py [water_level.py útvonal] [tohid.html fixture]
 
-SCRIPT = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/.hermes/scripts/water_level.py")
-FIXTURE = sys.argv[2] if len(sys.argv) > 2 else os.path.expanduser("~/hermes-proto/tohid.html")
+Alapértelmezés: a repóbeli script és a szintetikus fixture
+(tests/fixtures/water/tohid-synthetic.html) -> pontos értékeket ellenőriz.
+Más fixture megadásakor (pl. élő oldal mentése) csak szerkezeti ellenőrzés.
+"""
+import datetime as dt
+import importlib.util
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+DEFAULT_FIXTURE = REPO / "tests" / "fixtures" / "water" / "tohid-synthetic.html"
+SCRIPT = sys.argv[1] if len(sys.argv) > 1 else str(REPO / "hermes" / "scripts" / "water_level.py")
+FIXTURE = sys.argv[2] if len(sys.argv) > 2 else str(DEFAULT_FIXTURE)
+SYNTHETIC = Path(FIXTURE).resolve() == DEFAULT_FIXTURE
 
 spec = importlib.util.spec_from_file_location("water_level", SCRIPT)
 wl = importlib.util.module_from_spec(spec)
@@ -49,12 +57,20 @@ def raises_parse(html):
 def t_fixture():
     with open(FIXTURE, encoding="utf-8") as f:
         p = wl.parse(f.read())
-    assert p["observed"].isoformat() == "2026-10-16", p["observed"]
-    assert p["stations"]["442550"] == {"yesterday_morning": 34, "yesterday_evening": 33,
-                                       "today_morning": 32, "change_24h": -2}, p["stations"]["442550"]
-    assert p["stations"]["442600"] == {"yesterday_morning": 31, "yesterday_evening": None,
-                                       "today_morning": 30, "change_24h": -1}, p["stations"]["442600"]
-    assert wl.check(p) == []
+    if SYNTHETIC:
+        assert p["observed"].isoformat() == "2025-06-03", p["observed"]
+        assert p["stations"]["442550"] == {"yesterday_morning": 58, "yesterday_evening": 57,
+                                           "today_morning": 55, "change_24h": -3}, p["stations"]["442550"]
+        assert p["stations"]["442600"] == {"yesterday_morning": 54, "yesterday_evening": None,
+                                           "today_morning": 52, "change_24h": -2}, p["stations"]["442600"]
+        assert wl.check(p) == []
+    else:
+        # élő oldal: az értékek naponta változnak, csak a szerkezetet nézzük
+        assert isinstance(p["observed"], dt.date), p["observed"]
+        assert set(p["stations"]) == {"442550", "442600"}, p["stations"]
+        assert p["stations"]["442550"]["today_morning"] is not None, p["stations"]["442550"]
+        wl.check(p)  # tartományhiba -> ParseError; ellentmondás csak figyelmeztetés
+        wl.to_payload(p)
 
 
 def t_payload():
@@ -81,7 +97,7 @@ def t_inconsistent_warns():
     assert len(w) == 1 and "442550" in w[0], w
 
 
-case("fixture parse (élő HTML)", t_fixture)
+case(f"fixture parse ({'szintetikus' if SYNTHETIC else 'külső'}: {Path(FIXTURE).name})", t_fixture)
 case("payload + measured_at nyári idő", t_payload)
 case("measured_at téli idő (+01:00)", t_winter_offset)
 case("átlag hiányzik -> mezők kimaradnak", t_avg_missing_value)
