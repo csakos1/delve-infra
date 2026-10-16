@@ -1,0 +1,78 @@
+# Curated, secret-free excerpt of the agent user's ~/.hermes/config.yaml
+# (Hermes Agent v0.22.2). Only the keys this setup deliberately sets; everything
+# else is the Hermes default. This is NOT a complete config.
+#
+# Verify against the live config (as the agent user, with the Hermes Python):
+#   $PY -I ops/config-check.py --fragment hermes/config.fragments.yaml
+#
+# Placeholders: /home/<operator>/ = the inference user's home directory.
+# "<redacted>" = secret-like value; only its presence is checked.
+# Hermes parses config with ruamel.yaml (YAML 1.2), so "off" is a string,
+# not a boolean; it is quoted here to keep YAML 1.1 parsers from misreading it.
+
+# --- Inference endpoint: local llama-server (OpenAI-compatible) ---------------
+model:
+  default: /home/<operator>/models/qwen38/Qwen3.8-27B-UD-IQ4_XS.gguf
+  provider: custom
+  base_url: http://127.0.0.1:8080/v1
+  api_key: "<redacted>"          # llama-server has no auth; any value works
+  api_mode: chat_completions
+
+# Legacy provider format (hermes doctor suggests migrating to `providers:`).
+# The context-length pin must match llama-server's -c 65536 with -np 1.
+custom_providers:
+  - name: llama-qwen38
+    base_url: http://127.0.0.1:8080/v1
+    key_env: HERMES_CUSTOM_127_0_0_1_8080_API_KEY
+    model: /home/<operator>/models/qwen38/Qwen3.8-27B-UD-IQ4_XS.gguf
+    api_mode: chat_completions
+    models:
+      "/home/<operator>/models/qwen38/Qwen3.8-27B-UD-IQ4_XS.gguf":
+        context_length: 65536
+
+# --- Networking ----------------------------------------------------------------
+network:
+  force_ipv4: true               # paired with /etc/gai.conf IPv4 precedence
+
+# --- Plugins / tools -------------------------------------------------------------
+plugins:
+  enabled:
+    - agentcards                 # publish_water_card + shared card schema/store
+  disabled: []
+
+# Blank Slate install: only the toolsets actually needed.
+# api_server has no explicit entry: it uses the default hermes-api-server
+# composite (filtered by Blank Slate) and enabled plugin toolsets are on by
+# default. Messaging platforms (telegram, discord, ...) are unused; their rows
+# that `hermes plugins enable` appended are omitted here.
+platform_toolsets:
+  cli: [file, skills, terminal, vision, agentcards]
+
+tools:
+  tool_search:
+    enabled: "off"               # all 11 tools eager: 1 tool round instead of 3
+
+# --- Approvals ---------------------------------------------------------------------
+# manual: the "smart" mode's auxiliary LLM call would occupy the single
+# llama-server slot (-np 1) and evict the prompt cache.
+# The deny list is a guard rail, not a security boundary (the agent user is).
+# Patterns are fnmatch on the whole lower-cased command, hence the leading '*'.
+approvals:
+  mode: manual
+  timeout: 300
+  deny:
+    - "*rm -rf *"
+    - "*rm -fr *"
+    - "*rm -r -f *"
+    - "*rm -f -r *"
+    - "*rm -Rf *"                # redundant after lower-casing; kept for now
+    - "*rm -fR *"                # redundant after lower-casing; kept for now
+    - "*--recursive*--force*"
+    - "*--force*--recursive*"
+    - "*curl*|*sh*"
+    - "*wget*|*sh*"
+    - "*dd if=* of=/dev/*"       # also covered by the built-in hardline rules
+    - "*mkfs*"
+
+checkpoints:
+  enabled: true
