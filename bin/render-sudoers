@@ -1,0 +1,20 @@
+#!/bin/sh
+# Render etc/sudoers.d/agent.template with disk ids from site.env to stdout.
+# Validate and install:
+#   bin/render-sudoers > /tmp/agent.sudoers && sudo visudo -cf /tmp/agent.sudoers \
+#     && sudo install -m 0440 -o root -g root /tmp/agent.sudoers /etc/sudoers.d/agent
+set -eu
+cd "$(dirname "$0")/.."
+ENV_FILE=${1:-./site.env}
+[ -r "$ENV_FILE" ] || { echo "missing $ENV_FILE (see site.env.example)" >&2; exit 1; }
+. "$ENV_FILE"
+out=$(mktemp); trap 'rm -f "$out"' EXIT
+cat etc/sudoers.d/agent.template > "$out"
+for n in 1 2 3 4; do
+  eval "v=\${DISK_$n:-}"
+  [ -n "$v" ] || { echo "DISK_$n not set" >&2; exit 1; }
+  [ -e "/dev/disk/by-id/$v" ] || { echo "DISK_$n: /dev/disk/by-id/$v not found" >&2; exit 1; }
+  sed -i "s#@DISK_$n@#$v#g" "$out"
+done
+if grep -q '@DISK_' "$out"; then echo "unrendered placeholder left" >&2; exit 1; fi
+cat "$out"

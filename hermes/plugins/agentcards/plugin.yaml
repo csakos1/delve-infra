@@ -1,0 +1,6 @@
+name: agentcards
+version: "0.1.0"
+description: "Card publishing tools (publish_*_card) for the phone dashboard. Append-only JSONL until the backend exists."
+author: "csakos"
+provides_tools:
+  - publish_water_card

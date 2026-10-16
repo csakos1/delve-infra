@@ -1,0 +1,13 @@
+# agent: csak olvasó SMART-lekérdezés, by-id útvonalon, 2026-10-16
+agent ALL=(root) NOPASSWD: /usr/bin/smartctl -H /dev/disk/by-id/@DISK_3@
+agent ALL=(root) NOPASSWD: /usr/bin/smartctl -a /dev/disk/by-id/@DISK_3@
+agent ALL=(root) NOPASSWD: /usr/bin/smartctl -a -j /dev/disk/by-id/@DISK_3@
+agent ALL=(root) NOPASSWD: /usr/bin/smartctl -H /dev/disk/by-id/@DISK_4@
+agent ALL=(root) NOPASSWD: /usr/bin/smartctl -a /dev/disk/by-id/@DISK_4@
+agent ALL=(root) NOPASSWD: /usr/bin/smartctl -a -j /dev/disk/by-id/@DISK_4@
+agent ALL=(root) NOPASSWD: /usr/bin/smartctl -H /dev/disk/by-id/@DISK_1@
+agent ALL=(root) NOPASSWD: /usr/bin/smartctl -a /dev/disk/by-id/@DISK_1@
+agent ALL=(root) NOPASSWD: /usr/bin/smartctl -a -j /dev/disk/by-id/@DISK_1@
+agent ALL=(root) NOPASSWD: /usr/bin/smartctl -H /dev/disk/by-id/@DISK_2@
+agent ALL=(root) NOPASSWD: /usr/bin/smartctl -a /dev/disk/by-id/@DISK_2@
+agent ALL=(root) NOPASSWD: /usr/bin/smartctl -a -j /dev/disk/by-id/@DISK_2@
