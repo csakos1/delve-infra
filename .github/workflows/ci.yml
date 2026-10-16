@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   secrets:
-    name: secret scan (gitleaks, full history)
+    name: secret scan (gitleaks; full history on schedule/dispatch)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
