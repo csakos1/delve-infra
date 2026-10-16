@@ -1,0 +1,74 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * 1"     # weekly full-history secret scan
+
+permissions:
+  contents: read
+
+jobs:
+  secrets:
+    name: secret scan (gitleaks, full history)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  offline-tests:
+    name: offline tests (stdlib only, py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: syntax (python + shell)
+        run: |
+          python -m py_compile $(git ls-files '*.py')
+          for f in $(git ls-files '*.sh' 'bin/*' '.githooks/*'); do
+            head -1 "$f" | grep -qE '^#!.*(ba)?sh' || continue
+            bash -n "$f" && echo "ok  $f"
+          done
+
+      - name: synthetic fixture is reproducible
+        run: |
+          python -I tests/fixtures/water/make_tohid_synthetic.py
+          git diff --exit-code -- tests/fixtures/water/
+
+      - name: unit tests
+        # run from outside the repo to prove the tests are path-independent
+        working-directory: /tmp
+        run: |
+          set -e
+          for t in test_water_level test_water_schema test_agentcards; do
+            echo "::group::$t"
+            python -I "$GITHUB_WORKSPACE/tests/$t.py"
+            echo "::endgroup::"
+          done
+
+      - name: hermes script dry-run on the synthetic fixture
+        env:
+          HERMES_HOME: ${{ runner.temp }}/hermes
+        run: |
+          mkdir -p "$HERMES_HOME/plugins" "$HERMES_HOME/logs"
+          ln -s "$GITHUB_WORKSPACE/hermes/plugins/agentcards" "$HERMES_HOME/plugins/agentcards"
+          # the card validator rejects measured_at older than 30 days -> re-date a copy to yesterday
+          D=$(LC_ALL=C date -u -d yesterday '+%-d %B  %Y')
+          sed "s/Observed on: 3 June  2025/Observed on: $D/" tests/fixtures/water/tohid-synthetic.html > /tmp/tohid.html
+          grep -c "Observed on: $D" /tmp/tohid.html
+          python -I hermes/scripts/water_level.py --file /tmp/tohid.html \
+            --dry-run --force --state "$HERMES_HOME/state.json" | tee /tmp/ev.json
+          python -I -c "import json; e=json.load(open('/tmp/ev.json')); assert e['type']=='water' and e['payload']['level_cm']==55, e; print('event ok', e['id'])"
