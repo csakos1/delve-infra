@@ -8,7 +8,7 @@ ExecStart=%h/src/llama.cpp/build/bin/llama-server \
   -ngl 99 -c 65536 -np 1 -fa on -ctk q8_0 -ctv q8_0 \
   -sm layer -ts 11,6 --jinja \
   --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0 \
-  --host 127.0.0.1 --port 8080
+  --host 127.0.0.1 --port 8080 --metrics --mmproj %h/models/qwen38/mmproj-BF16.gguf --no-mmproj-offload
 Restart=on-failure
 RestartSec=10
 
