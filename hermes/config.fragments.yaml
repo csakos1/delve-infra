@@ -29,6 +29,20 @@ custom_providers:
     models:
       "/home/<operator>/models/qwen38/Qwen3.8-27B-UD-IQ4_XS.gguf":
         context_length: 65536
+  # Thinking variant, selected per run by delve-backend (run body: provider + model).
+  # The distinct base_url is required: Hermes normalizes custom:<name> to "custom" and
+  # resolves extra_body by base_url + model, so an identical URL always matches the first entry.
+  - name: llama-qwen38-think
+    base_url: http://localhost:8080/v1
+    key_env: HERMES_CUSTOM_127_0_0_1_8080_API_KEY
+    model: /home/<operator>/models/qwen38/Qwen3.8-27B-UD-IQ4_XS.gguf
+    api_mode: chat_completions
+    models:
+      "/home/<operator>/models/qwen38/Qwen3.8-27B-UD-IQ4_XS.gguf":
+        context_length: 65536
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: true
 
 # --- Networking ----------------------------------------------------------------
 network:
