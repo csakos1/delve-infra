@@ -1,12 +1,12 @@
-# agent-infra
+# Delve — infrastructure
 
-[![ci](https://github.com/csakos1/agent-infra/actions/workflows/ci.yml/badge.svg)](https://github.com/csakos1/agent-infra/actions/workflows/ci.yml)
+[![ci](https://github.com/csakos1/delve-infra/actions/workflows/ci.yml/badge.svg)](https://github.com/csakos1/delve-infra/actions/workflows/ci.yml)
 
 Infrastructure-as-code for an always-on, **fully local** personal AI agent on a single
 Arch Linux workstation: a 27B model served by `llama.cpp` across two consumer GPUs,
 [Hermes Agent](https://github.com/NousResearch/hermes-agent) as the agent runtime,
 running as an unprivileged Linux user, with deterministic background jobs that publish
-structured "cards" for a (planned) phone client.
+structured "cards" for **Delve**, the (planned) Flutter phone client.
 
 This repository holds the sanitized, versioned copy of everything that lives on the
 host: systemd units, the agent's curated configuration, a small Hermes plugin, a
