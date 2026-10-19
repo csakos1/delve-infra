@@ -8,6 +8,12 @@ echo "=== net ==="; ip -br link | grep -Ei 'proton|pvpn|tailscale'; tailscale st
 echo "=== llama (s boot óta) ==="
 journalctl --user -u llama-server -b -o short-monotonic --no-pager | grep -Ei 'Started|listening|model loaded' | head -5
 curl -s -m 2 127.0.0.1:8080/health; echo
+echo "=== delve-backend ==="
+systemctl show delve-backend -p ActiveState -p NRestarts -p ExecMainStartTimestampMonotonic
+journalctl -u delve-backend -b -o cat --no-pager | grep -E '"(startup|hermes health changed)"' | tail -3
+curl -s -m 2 127.0.0.1:8700/api/v1/health; echo
+echo "revision: $(cat /opt/delve/current/REVISION 2>/dev/null)"
+tailscale serve status 2>&1 | head -4
 echo "=== agent: gateway (s boot óta) ==="
 sudo machinectl shell agent@ /usr/bin/bash -lc '
   export SYSTEMD_PAGER=

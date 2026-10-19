@@ -92,11 +92,13 @@ wrong thing and puts the boundary where it cannot be talked around:
 
 ```
 bin/
+  delve-env                 writes /etc/delve/env from a development env file
   render-sudoers            fills etc/sudoers.d/agent.template from site.env, checks disks exist
   wait-llama.sh             ExecStartPre: wait up to 120 s for llama-server /health
 etc/
   gai.conf.fragment         prefer IPv4 in getaddrinfo()
   ssh/sshd_config.d/        key-only SSH
+  sysusers.d/delve.conf     the backend's system user
   sudoers.d/agent.template  smartctl whitelist with @DISK_n@ placeholders
 hermes/
   SOUL.md                   identity + "Operating rules"
@@ -110,6 +112,7 @@ ops/
   post-boot-check.sh        full health check after a reboot
 systemd/
   llama-server.service      user unit for the model server
+  delve-backend.service     system unit for the backend, hardened (loopback only)
   hermes-gateway.override.conf  drop-in for the Hermes-generated gateway unit
   reference/                the generated unit, for reference only (not edited)
 tests/
@@ -147,7 +150,20 @@ This is a record of a working setup, not a turnkey installer. Paths use
      && sudo install -m 0440 -o root -g root /tmp/agent.sudoers /etc/sudoers.d/agent
    ```
 10. **Host:** `etc/gai.conf.fragment`, `etc/ssh/sshd_config.d/10-no-password.conf`.
-11. **Reboot without logging in**, connect over SSH, run `ops/post-boot-check.sh`.
+11. **Backend user and settings:** `etc/sysusers.d/delve.conf` → `/etc/sysusers.d/`,
+    `sudo systemd-sysusers`; PostgreSQL role and database `delve` (peer auth over the
+    unix socket, `listen_addresses = ''`); then `sudo bin/delve-env <dev.env>` writes
+    `/etc/delve/env` (root:delve 0640) from a working development env file.
+12. **Backend:** from a `delve-backend` checkout, `sudo deploy/install.sh` builds
+    `/opt/delve/releases/<sha>`, migrates as `delve`, switches `/opt/delve/current` and
+    installs the `delve` CLI wrapper (`sudo delve pair`). Then
+    `systemd/delve-backend.service` → `/etc/systemd/system/`,
+    `sudo systemctl enable --now delve-backend`; check
+    `curl -s 127.0.0.1:8700/api/v1/health` and `systemd-analyze security delve-backend`.
+13. **Phone access:** `sudo tailscale serve --bg --https=443 http://127.0.0.1:8700`
+    (MagicDNS + HTTPS certificates enabled in the tailnet); the app pairs with a code from
+    `sudo delve pair`.
+14. **Reboot without logging in**, connect over SSH, run `ops/post-boot-check.sh`.
 
 ## Tests
 
