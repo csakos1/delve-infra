@@ -14,8 +14,8 @@ no-agent cron script, privilege rules, operational scripts, and the tests and pr
 fixtures that pin the behaviour down.
 
 > **Status (2026-10):** inference, agent runtime, API server, plugin and cron job are
-> running. The service layer (units, drop-in, boot ordering) is reboot-tested; a
-> full-stack reboot test including the plugin and cron job is pending. The FastAPI
+> running. The full stack (units, drop-in, boot ordering, plugin, cron job) is
+> reboot-tested (2026-10-19). The FastAPI
 > backend and the Flutter client are the next steps and will live in their own
 > repositories.
 
