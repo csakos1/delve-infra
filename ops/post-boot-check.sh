@@ -12,7 +12,10 @@ echo "=== delve-backend ==="
 systemctl show delve-backend -p ActiveState -p NRestarts -p ExecMainStartTimestampMonotonic
 journalctl -u delve-backend -b -o cat --no-pager | grep -E '"(startup|hermes health changed)"' | tail -3
 curl -s -m 2 127.0.0.1:8700/api/v1/health; echo
-echo "revision: $(cat /opt/delve/current/REVISION 2>/dev/null)"
+# /opt/delve is root:delve 0750, so the running release reports its own sha
+curl -s -m 2 127.0.0.1:8700/api/v1/meta \
+  | python3 -Ic 'import json,sys; m=json.load(sys.stdin); print("revision:", m.get("revision"), "api_revision:", m.get("api_revision"))' \
+  2>/dev/null || echo "revision: ? (meta unreachable)"
 tailscale serve status 2>&1 | head -4
 echo "=== agent: gateway (s boot óta) ==="
 sudo machinectl shell agent@ /usr/bin/bash -lc '

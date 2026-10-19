@@ -15,9 +15,11 @@ fixtures that pin the behaviour down.
 
 > **Status (2026-10):** inference, agent runtime, API server, plugin and cron job are
 > running. The full stack (units, drop-in, boot ordering, plugin, cron job) is
-> reboot-tested (2026-10-19). The FastAPI
-> backend and the Flutter client are the next steps and will live in their own
-> repositories.
+> reboot-tested (2026-10-19). The backend
+> ([`csakos1/delve-backend`](https://github.com/csakos1/delve-backend), FastAPI +
+> PostgreSQL) runs as a hardened system service behind `tailscale serve` and is
+> reboot-tested too (2026-10-19). The Flutter client is the next step and will live in its
+> own repository.
 
 ## Contents
 
@@ -35,7 +37,7 @@ fixtures that pin the behaviour down.
 ## Architecture
 
 ```
- phone client (planned)  ⇄  WebSocket + push, over Tailscale only  ⇄  backend (planned, FastAPI + Postgres)
+ phone client (planned)  ⇄  HTTPS + WSS, tailscale serve, tailnet only  ⇄  delve-backend (user: delve, 127.0.0.1:8700)
                                                                           ⇅ HTTP + SSE, 127.0.0.1, Bearer
                               Hermes gateway / API server  (user: agent, 127.0.0.1:8642)
                                 │  systemd user unit + drop-in, linger, ExecStartPre: wait-llama.sh
@@ -55,7 +57,8 @@ fixtures that pin the behaviour down.
 | `llama-server` | operator user | `127.0.0.1:8080` | systemd **user** unit, linger |
 | Hermes gateway + API server | dedicated `agent` user | `127.0.0.1:8642` | systemd user unit + drop-in, linger |
 | `balaton-water` job | `agent` (inside the gateway's scheduler) | – | Hermes cron, `--no-agent` |
-| backend / client | – | Tailscale only | planned |
+| `delve-backend` | system user `delve` | `127.0.0.1:8700`; tailnet via `tailscale serve` | system unit (`systemd/delve-backend.service`) |
+| phone client | – | – | planned |
 
 Everything starts from systemd at boot without a graphical login. The gateway waits
 for the model server's health endpoint before it starts (`bin/wait-llama.sh`).
@@ -77,7 +80,7 @@ wrong thing and puts the boundary where it cannot be talked around:
    The deny list is a guard rail, not a boundary: it is tested deterministically
    (`tests/deny-matrix.py`, 19 cases) against Hermes' own matcher.
 3. **Localhost only.** Both the model server and the Hermes API server bind to
-   `127.0.0.1`. Only the (planned) backend will be exposed, and only on the tailnet.
+   `127.0.0.1`. Only the backend is exposed, and only on the tailnet (`tailscale serve`).
 4. **Behavioural rules** in `hermes/SOUL.md`: state facts about the system only from
    tool output; never modify an approved command (in testing the model escalated
    `rm -r` to `rm -rf` on its own); no retry in another form after a block; say so
@@ -150,8 +153,9 @@ This is a record of a working setup, not a turnkey installer. Paths use
      && sudo install -m 0440 -o root -g root /tmp/agent.sudoers /etc/sudoers.d/agent
    ```
 10. **Host:** `etc/gai.conf.fragment`, `etc/ssh/sshd_config.d/10-no-password.conf`.
-11. **Backend user and settings:** `etc/sysusers.d/delve.conf` → `/etc/sysusers.d/`,
-    `sudo systemd-sysusers`; PostgreSQL role and database `delve` (peer auth over the
+11. **Backend user and settings:**
+    `sudo install -D -m 0644 etc/sysusers.d/delve.conf /etc/sysusers.d/delve.conf`
+    (Arch has no `/etc/sysusers.d` by default), `sudo systemd-sysusers`; PostgreSQL role and database `delve` (peer auth over the
     unix socket, `listen_addresses = ''`); then `sudo bin/delve-env <dev.env>` writes
     `/etc/delve/env` (root:delve 0640) from a working development env file.
 12. **Backend:** from a `delve-backend` checkout, `sudo deploy/install.sh` builds
