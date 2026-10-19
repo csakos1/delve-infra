@@ -19,6 +19,11 @@ README).
 
 ## `GET /v1/capabilities` ✅
 
+Fixture: `tests/fixtures/protocol/capabilities.json`.
+
+- Shape: `{object: "hermes.api_server.capabilities", auth, runtime, features, endpoints}`.
+  The flags are under **`features`**, not at the top level; a flag is either `true`/`false`
+  or an object (`runs_idempotency: {supported, durable, retention_seconds}`).
 - `runtime.mode: "server_agent"`, `tool_execution: "server"`.
 - `true`: run submission, idempotency (`retention_seconds: 86400`), run status, run events
   (SSE), stop, steer, approval response, tool progress events, approval events, session
@@ -40,7 +45,16 @@ not the one it was tested against.
   → `409 idempotency_key_conflict`.
 - Response `202 {"run_id": "run_<hex>", "status": "started"}`.
 - Without `session_id`, the run id becomes the session id — always send one.
-- No `model` field: the model is fixed by configuration.
+- Without `provider`/`model` the run uses the global route (`runtime.route_source:
+  "global"`). With `"provider": "custom:<name>", "model": "<id>"` it uses that
+  `custom_providers` entry for this run only; `run.completed.runtime` then reports
+  `route_source: "raw_request"` and echoes `requested: {provider, model}` — a client can
+  check this to confirm the route took effect. This is how per-conversation thinking
+  works here (fixtures `think.*`; see the comment in `hermes/config.fragments.yaml` on
+  why the thinking entry needs its own `base_url`).
+- A thinking run streams no reasoning: only the answer arrives as `message.delta`, and
+  `reasoning.available.text` is the answer too. The reasoning text is in the session
+  messages (below).
 - `instructions` is an ephemeral system-prompt addition for this run only; persistent
   rules belong in `SOUL.md`.
 - Errors seen: `409 permission_denied` (session owned by another surface, e.g. the CLI);
@@ -116,13 +130,22 @@ the run ends with `run.completed`. Detect it as: `approval.request`, then
 
 ## Sessions API ✅
 
-- `GET /api/sessions/{id}`: metadata, including `title`, filled by title generation
-  ~1.2 s after the first run; token counters (session `input_tokens` counts only the
-  non-cached part).
-- `GET /api/sessions/{id}/messages?inline_images=false`: messages, `pagination.limit: 500`,
-  no total count.
+- `GET /api/sessions/{id}` → `{"object": "hermes.session", "session": {...}}` — the
+  metadata is **wrapped in `session`**: `id`, `title` (filled by title generation ~1.2 s
+  after the first run), `message_count`, `tool_call_count`, `api_call_count`, token
+  counters (session `input_tokens` counts only the non-cached part; `reasoning_tokens`
+  stays 0 even for thinking runs). Fixture: `think.session.json`.
+- `GET /api/sessions/{id}/messages?inline_images=false` →
+  `{object: "list", session_id, data: [...], pagination: {limit: 500, offset, order,
+  returned}}`, no total count. Message fields: `id` (integer), `role`, `content`,
+  `reasoning` / `reasoning_content` (equal; the thinking text of that assistant message,
+  `null` without thinking), `tool_calls`, `tool_call_id`, `tool_name`, `finish_reason`,
+  `display_kind`, `token_count`, `timestamp`. A run that calls tools has several
+  assistant messages, each with its own reasoning. Fixture: `think.messages.json`.
 
 ## `GET /v1/toolsets` ✅
+
+Fixture: `tests/fixtures/toolsets/toolsets.json`.
 
 `{"object": "list", "platform": "api_server", "data": [{name, label, description, enabled, configured, tools[]}]}`.
 Enabled here: `terminal`, `file`, `vision`, `skills`, `agentcards` (11 tools).
