@@ -167,7 +167,15 @@ This is a record of a working setup, not a turnkey installer. Paths use
 13. **Phone access:** `sudo tailscale serve --bg --https=443 http://127.0.0.1:8700`
     (MagicDNS + HTTPS certificates enabled in the tailnet); the app pairs with a code from
     `sudo delve pair`.
-14. **Reboot without logging in**, connect over SSH, run `ops/post-boot-check.sh`.
+14. **Push notifications (optional):** a Firebase project with an Android app
+    (the app's application id); its service account key →
+    `sudo install -D -o root -g delve -m 0640 <key>.json /etc/delve/fcm.json`; add
+    `FCM_SERVICE_ACCOUNT_FILE=/etc/delve/fcm.json` and `FCM_PROJECT_ID=<id>` to
+    `/etc/delve/env` (`bin/delve-env` keeps them on a later `FORCE=1` run); install
+    `systemd/delve-backend.service.d/fcm.conf` → `/etc/systemd/system/delve-backend.service.d/`,
+    `sudo systemctl daemon-reload && sudo systemctl restart delve-backend`; the startup log
+    line says `"push": true`, and `systemd-analyze security delve-backend` stays about 1.2.
+15. **Reboot without logging in**, connect over SSH, run `ops/post-boot-check.sh`.
 
 ## Tests
 

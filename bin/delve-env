@@ -2,7 +2,8 @@
 # Write /etc/delve/env (root:delve 0640) from a dev env file, switching the database to the
 # production `delve` DB (peer auth as the `delve` user). Other keys are kept as they are.
 #   sudo bin/delve-env ~/.config/delve/dev.env
-# Refuses to overwrite an existing /etc/delve/env unless FORCE=1.
+# Refuses to overwrite an existing /etc/delve/env unless FORCE=1. Push settings (FCM_*,
+# PUSH_*) already in /etc/delve/env are kept unless the dev file sets them.
 set -eu
 SRC=${1:?usage: delve-env <dev.env>}
 DEST=/etc/delve/env
@@ -26,6 +27,11 @@ tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
   env -i HOME="$OWNER_HOME" PATH=/usr/bin:/bin sh -ec '
     set -a; . "$1"; set +a; shift
     for k in "$@"; do eval "v=\${$k}"; printf "%s=%s\n" "$k" "$v"; done' sh "$SRC" $keys
+  if [ -r "$DEST" ]; then
+    for line in $(grep -E '^(FCM|PUSH)_[A-Z0-9_]*=' "$DEST" || true); do
+      printf '%s\n' "$keys" | grep -q -x "${line%%=*}" || printf '%s\n' "$line"
+    done
+  fi
 } > "$tmp"
 if grep -v '^#' "$tmp" | grep -q '[$`"'"'"'\\ ]'; then
   echo "delve-env: a value still contains \$, quotes, backslashes or spaces:" >&2
