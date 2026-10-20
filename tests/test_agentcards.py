@@ -36,14 +36,24 @@ for name, payload, sev, expect_ok in cases:
     print(f"{'OK  ' if ok else 'FAIL'} {name:16} valid={got!s:5} {info}")
 
 with tempfile.TemporaryDirectory() as d:
-    p = os.path.join(d, "sub", "events.jsonl")
-    for ev in events:
-        store.append_event(ev, p)
+    old_umask = os.umask(0o077)  # the modes must not depend on the umask
+    try:
+        # an older install: 0700 directory, 0600 file - fixed by the next write
+        os.makedirs(os.path.join(d, "sub"), mode=0o700)
+        p = os.path.join(d, "sub", "events.jsonl")
+        os.close(os.open(p, os.O_WRONLY | os.O_CREAT, 0o600))
+        for ev in events:
+            store.append_event(ev, p)
+    finally:
+        os.umask(old_umask)
     lines = [json.loads(l) for l in open(p, encoding="utf-8")]
     mode = stat.S_IMODE(os.stat(p).st_mode)
-    store_ok = len(lines) == len(events) and mode == 0o600 and lines[0]["v"] == 1
+    dmode = stat.S_IMODE(os.stat(os.path.dirname(p)).st_mode)
+    store_ok = (len(lines) == len(events) and mode == 0o644 and dmode == 0o755
+                and lines[0]["v"] == 1)
     fails += not store_ok
-    print(f"{'OK  ' if store_ok else 'FAIL'} store            lines={len(lines)} mode={oct(mode)}")
+    print(f"{'OK  ' if store_ok else 'FAIL'} store            lines={len(lines)} "
+          f"mode={oct(mode)} dir={oct(dmode)}")
 
 print(f"\n{len(cases) + 1 - fails}/{len(cases) + 1} OK")
 sys.exit(1 if fails else 0)

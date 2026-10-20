@@ -175,7 +175,15 @@ This is a record of a working setup, not a turnkey installer. Paths use
     `systemd/delve-backend.service.d/fcm.conf` → `/etc/systemd/system/delve-backend.service.d/`,
     `sudo systemctl daemon-reload && sudo systemctl restart delve-backend`; the startup log
     line says `"push": true`, and `systemd-analyze security delve-backend` stays about 1.2.
-15. **Reboot without logging in**, connect over SSH, run `ops/post-boot-check.sh`.
+15. **Cards for the backend:** copy `hermes/plugins/agentcards/` to
+    `~agent/.hermes/plugins/agentcards/` again (the store writes `cards/` as 0755 and
+    `events.jsonl` as 0644 - the agent's home stays 0700) and restart the gateway; fix an
+    existing install at once with
+    `sudo chmod 0755 ~agent/.hermes/cards && sudo chmod 0644 ~agent/.hermes/cards/events.jsonl`;
+    install `systemd/delve-backend.service.d/cards.conf` →
+    `/etc/systemd/system/delve-backend.service.d/`, `daemon-reload`, restart the backend; its
+    log says `"cards ingested"`.
+16. **Reboot without logging in**, connect over SSH, run `ops/post-boot-check.sh`.
 
 ## Tests
 

@@ -5,7 +5,7 @@
 # the backend polls them and recovers on its own.
 #
 # Later steps add drop-ins instead of editing this file:
-#   12/7  cards:  BindReadOnlyPaths=/home/agent/.hermes/cards:/run/delve/cards
+#   B2    cards:  BindReadOnlyPaths=/home/agent/.hermes/cards:/run/delve/cards - delve-backend.service.d/cards.conf
 #   B1    FCM:    outbound HTTPS to Google (IPAddressDeny below) - delve-backend.service.d/fcm.conf
 #   12/9, 12/11  sudo helpers: NoNewPrivileges=no and the matching SystemCallFilter
 
