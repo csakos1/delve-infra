@@ -1,5 +1,6 @@
 # One instance per connection of delve-helper.socket. Runs bin/delve-helper as root with
-# fixed verbs only (llama.status|start|stop, hermes.status, gpu.status), no arguments.
+# fixed verbs only (llama.status|start|stop, hermes.status, gpu.status, host.status,
+# agent.incidents), no arguments.
 # Install: bin/delve-helper -> /usr/local/lib/delve/delve-helper (root 0755),
 #          etc/delve/helper.env.example -> /etc/delve/helper.env (edit LLAMA_USER).
 # Not set on purpose: PrivateDevices (nvidia-smi needs /dev/nvidia*) and PrivateUsers

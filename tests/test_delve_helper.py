@@ -220,6 +220,95 @@ class Gpus(Base):
         self.assertEqual(self.ask('{"verb": "gpu.status"}')["error"], "failed")
 
 
+class Host(Base):
+    def setUp(self) -> None:
+        super().setUp()
+        self._proc = helper.PROC
+        self.tmp = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"delve-proc-{os.getpid()}")
+        os.makedirs(os.path.join(self.tmp, "sys", "kernel", "random"), exist_ok=True)
+        for src, dst in (("proc-uptime.txt", "uptime"), ("proc-stat-excerpt.txt", "stat"),
+                         ("proc-boot-id.txt", "sys/kernel/random/boot_id")):
+            with open(os.path.join(self.tmp, dst), "w", encoding="ascii") as f:
+                f.write(fixture(src))
+        helper.PROC = self.tmp
+
+    def tearDown(self) -> None:
+        helper.PROC = self._proc
+        super().tearDown()
+
+    def test_host_status(self) -> None:
+        fake = self.use({})
+        r = self.ask('{"verb": "host.status"}')
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["data"], {"uptime_s": 135358, "booted_at": 1792443359,
+                                     "boot_id": "8ea7721c-4790-4a12-a981-b52a87f45566"})
+        self.assertEqual(fake.calls, [])  # files only, no command
+
+    def test_host_status_without_btime(self) -> None:
+        with open(os.path.join(self.tmp, "stat"), "w", encoding="ascii") as f:
+            f.write("cpu  1 2 3\n")
+        r = self.ask('{"verb": "host.status"}')
+        self.assertEqual((r["ok"], r["error"]), (False, "failed"))
+        self.assertIn("btime", r["message"])
+
+
+INC_ENV = dict(ENV, HERMES_BIN="/home/agent/.local/bin/hermes")
+INC_ARGV = (
+    "/usr/bin/systemd-run", "--user", "-M", "agent@", "--pipe", "--wait", "--quiet",
+    "--collect", "--", "/home/agent/.local/bin/hermes", "cron", "incidents",
+)
+
+
+class Incidents(Base):
+    def ask_inc(self, env: dict[str, str] = INC_ENV) -> dict:
+        out, _ = helper.respond(b'{"verb": "agent.incidents"}', env)
+        return json.loads(json.dumps(out))
+
+    def test_closed_incident(self) -> None:
+        fake = self.use({INC_ARGV: (0, fixture("incidents-closed.txt"), "")})
+        r = self.ask_inc()
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["data"]["incidents"], [{
+            "id": "98de85_009110dce5cf", "state": "closed", "job": "98de85fe6a1f",
+            "type": "script", "first_seen": "2026-10-16T21:35:16.146881+02:00",
+            "last_seen": "2026-10-16T21:35:16.146881+02:00",
+            "error": "Script exited with code 2 stderr: cron_failtest: szimulált parse_failed",
+        }])
+        self.assertNotIn("/home/agent/.hermes/cron/output", json.dumps(r))
+        self.assertEqual(fake.calls[0][1], helper.AGENT_TIMEOUT_S)
+
+    def test_open_incident(self) -> None:
+        self.use({INC_ARGV: (0, fixture("incidents-detected-synthetic.txt"), "")})
+        r = self.ask_inc()
+        self.assertEqual([i["state"] for i in r["data"]["incidents"]], ["detected"])
+
+    def test_none(self) -> None:
+        self.use({INC_ARGV: (0, fixture("incidents-none-detected.txt"), "")})
+        self.assertEqual(self.ask_inc()["data"], {"incidents": []})
+
+    def test_layout_change_fails_loudly(self) -> None:
+        broken = fixture("incidents-closed.txt").replace("1 incident(s)", "2 incident(s)")
+        self.use({INC_ARGV: (0, broken, "")})
+        r = self.ask_inc()
+        self.assertEqual((r["ok"], r["error"]), (False, "failed"))
+        self.use({INC_ARGV: (0, "something else\n", "")})
+        self.assertEqual(self.ask_inc()["error"], "failed")
+
+    def test_command_fails(self) -> None:
+        self.use({INC_ARGV: (1, "", "Failed to connect to bus: No medium found\n")})
+        r = self.ask_inc()
+        self.assertEqual(r["error"], "failed")
+        self.assertIn("No medium found", r["message"])
+
+    def test_hermes_bin_required_and_checked(self) -> None:
+        self.use({})
+        for value in ("", "hermes", "/home/agent/../root/x", "/usr/bin/hermes;id", "/a b"):
+            with self.subTest(value=value):
+                r = self.ask_inc(dict(ENV, HERMES_BIN=value))
+                self.assertEqual(r["error"], "failed")
+                self.assertIn("HERMES_BIN", r["message"])
+
+
 class Process(unittest.TestCase):
     """The script itself over stdin/stdout, as systemd runs it (no verb that executes)."""
 

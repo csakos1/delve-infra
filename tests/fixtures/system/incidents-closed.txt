@@ -1,0 +1,14 @@
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         Cron Failure Incidents                          │
+└─────────────────────────────────────────────────────────────────────────┘
+
+  98de85_009110dce5cf  closed
+    Job:        98de85fe6a1f
+    Type:       script
+    First seen: 2026-10-16T21:35:16.146881+02:00
+    Last seen:  2026-10-16T21:35:16.146881+02:00
+    Error:      Script exited with code 2 stderr: cron_failtest: szimulált parse_failed
+    Output:     /home/agent/.hermes/cron/output/98de85fe6a1f/2026-10-16_21-35-16.md
+
+  1 incident(s)  |  ack one with: hermes cron incidents ack <id>

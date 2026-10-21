@@ -7,6 +7,7 @@ no capabilities, no devices), so the few things it needs root or another user fo
 through here, as fixed verbs without arguments:
 
     llama.status  llama.start  llama.stop  hermes.status  gpu.status
+    host.status   agent.incidents
 
 Request:  one JSON line  {"verb": "<verb>"}                       (at most 1 KiB)
 Response: one JSON line  {"ok": true, "verb": "<verb>", "data": {...}}
@@ -15,7 +16,8 @@ Response: one JSON line  {"ok": true, "verb": "<verb>", "data": {...}}
 Error codes: bad_request, unknown_verb, unit_not_found, failed, timeout.
 
 Settings come from the environment (`/etc/delve/helper.env`, see
-`etc/delve/helper.env.example`): LLAMA_USER, LLAMA_UNIT, AGENT_USER, HERMES_UNIT.
+`etc/delve/helper.env.example`): LLAMA_USER, LLAMA_UNIT, AGENT_USER, HERMES_UNIT,
+HERMES_BIN (only for agent.incidents).
 Only the standard library is used; no shell is involved.
 """
 
@@ -36,9 +38,12 @@ READ_TIMEOUT_S = 5
 SHOW_TIMEOUT_S = 10
 CONTROL_TIMEOUT_S = 25
 GPU_TIMEOUT_S = 10
+AGENT_TIMEOUT_S = 25
 
 SYSTEMCTL = "/usr/bin/systemctl"
+SYSTEMD_RUN = "/usr/bin/systemd-run"
 NVIDIA_SMI = "/usr/bin/nvidia-smi"
+PROC = "/proc"  # replaced in tests
 
 CHILD_ENV = {
     "PATH": "/usr/bin:/bin",
@@ -49,6 +54,7 @@ CHILD_ENV = {
 
 USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
 UNIT_RE = re.compile(r"[A-Za-z0-9_.@-]{1,128}")
+BIN_RE = re.compile(r"(?:/[A-Za-z0-9_.+-]+){1,16}")
 
 SHOW_PROPS = (
     "LoadState",
@@ -118,6 +124,14 @@ def settings(env: dict[str, str] | None = None) -> dict[str, str]:
         if not UNIT_RE.fullmatch(out[key]):
             raise HelperError("failed", f"{key.upper()} is not a valid unit name")
     return out
+
+
+def hermes_bin(env: dict[str, str] | None = None) -> str:
+    env = os.environ if env is None else env
+    path = env.get("HERMES_BIN", "")
+    if not BIN_RE.fullmatch(path) or "/../" in path + "/" or "/./" in path + "/":
+        raise HelperError("failed", "HERMES_BIN is not set to an absolute path")
+    return path
 
 
 def _first_line(text: str) -> str:
@@ -249,12 +263,113 @@ def gpu_status() -> dict[str, Any]:
     return {"gpus": parse_gpus(p.stdout)}
 
 
+# --- host ---------------------------------------------------------------------------
+
+
+def _read(name: str) -> str:
+    try:
+        with open(os.path.join(PROC, name), encoding="ascii") as f:
+            return f.read(64 * 1024)
+    except OSError as exc:
+        raise HelperError("failed", f"/proc/{name}: {exc.strerror or exc}") from exc
+
+
+def host_status() -> dict[str, Any]:
+    """Uptime and boot time; the backend cannot see /proc/uptime (ProcSubset=pid)."""
+    try:
+        uptime = float(_read("uptime").split()[0])
+    except (IndexError, ValueError) as exc:
+        raise HelperError("failed", "/proc/uptime: unexpected content") from exc
+    booted_at = None
+    for line in _read("stat").splitlines():
+        if line.startswith("btime "):
+            booted_at = _int(line.split()[1])
+    if booted_at is None:
+        raise HelperError("failed", "/proc/stat: no btime")
+    boot_id = _read("sys/kernel/random/boot_id").strip()
+    if not re.fullmatch(r"[0-9a-f-]{36}", boot_id):
+        raise HelperError("failed", "boot_id: unexpected content")
+    return {"uptime_s": int(uptime), "booted_at": booted_at, "boot_id": boot_id}
+
+
+# --- agent cron incidents -------------------------------------------------------------
+
+INCIDENT_STATES = ("detected", "alerted", "resolved", "closed")
+_INC_HEAD = re.compile(r"^\s{1,4}(?P<id>[0-9a-z_]{4,64})\s{2,}(?P<state>[a-z]+)\s*$")
+_INC_FIELD = re.compile(r"^\s{3,}(?P<key>Job|Type|First seen|Last seen|Error|Output):\s*(?P<value>.*)$")
+_INC_TOTAL = re.compile(r"^\s*(?P<n>\d+) incident\(s\)")
+_INC_KEYS = {
+    "Job": "job",
+    "Type": "type",
+    "First seen": "first_seen",
+    "Last seen": "last_seen",
+    "Error": "error",
+}
+
+
+def parse_incidents(text: str) -> list[dict[str, Any]]:
+    """`hermes cron incidents` table -> incidents (the output path is left out).
+
+    The listing has no JSON form (Hermes v0.22.2); a change in the layout fails loudly:
+    the summary count has to match the parsed blocks.
+    """
+    if "No cron failure incidents recorded." in text:
+        return []
+    out: list[dict[str, Any]] = []
+    total: int | None = None
+    for line in text.splitlines():
+        head = _INC_HEAD.match(line)
+        if head and head["state"] in INCIDENT_STATES:
+            out.append({"id": head["id"], "state": head["state"], "job": None, "type": None,
+                        "first_seen": None, "last_seen": None, "error": None})
+            continue
+        field = _INC_FIELD.match(line)
+        if field and out:
+            key = _INC_KEYS.get(field["key"])
+            if key:
+                out[-1][key] = field["value"].strip()[:200] or None
+            continue
+        m = _INC_TOTAL.match(line)
+        if m:
+            total = int(m["n"])
+    if total is None or total != len(out):
+        raise HelperError("failed", "hermes cron incidents: unexpected output")
+    return out
+
+
+def agent_incidents(env: dict[str, str] | None = None) -> dict[str, Any]:
+    cfg = settings(env)
+    argv = [
+        SYSTEMD_RUN,
+        "--user",
+        "-M",
+        f"{cfg['agent_user']}@",
+        "--pipe",
+        "--wait",
+        "--quiet",
+        "--collect",
+        "--",
+        hermes_bin(env),
+        "cron",
+        "incidents",
+    ]
+    p = RUN(argv, AGENT_TIMEOUT_S)
+    if p.returncode != 0:
+        msg = _first_line(p.stderr) or _first_line(p.stdout) or f"exit {p.returncode}"
+        raise HelperError("failed", f"hermes cron incidents: {msg}")
+    return {"incidents": parse_incidents(p.stdout)}
+
+
 # --- dispatch -----------------------------------------------------------------------
 
 
 def handle(verb: str, env: dict[str, str] | None = None) -> dict[str, Any]:
     if verb == "gpu.status":
         return gpu_status()
+    if verb == "host.status":
+        return host_status()
+    if verb == "agent.incidents":
+        return agent_incidents(env)
     cfg = settings(env)
     if verb == "llama.status":
         return _show(cfg["llama_user"], cfg["llama_unit"])
@@ -267,7 +382,15 @@ def handle(verb: str, env: dict[str, str] | None = None) -> dict[str, Any]:
     raise HelperError("unknown_verb", "unknown verb")
 
 
-VERBS = ("llama.status", "llama.start", "llama.stop", "hermes.status", "gpu.status")
+VERBS = (
+    "llama.status",
+    "llama.start",
+    "llama.stop",
+    "hermes.status",
+    "gpu.status",
+    "host.status",
+    "agent.incidents",
+)
 
 
 def parse_request(raw: bytes) -> str:

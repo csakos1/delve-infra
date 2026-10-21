@@ -24,3 +24,19 @@ Taken on the host on 2026-10-21 (llama.cpp e287bd872, Hermes v0.22.2, driver 615
 
 Timings seen: `systemctl --user -M <user>@ start llama-server` → `/health` 200 after 9.4 s
 (model files in the page cache); after a cold boot the model is loaded at ~24 s.
+
+## B4 samples (2026-10-21)
+
+- `incidents-closed.txt`: `hermes cron incidents` as the agent user with one acknowledged
+  incident (the cron failure test of 2026-10-16). The listing has no JSON form; the helper
+  parses the blocks and checks them against the `N incident(s)` summary line, and leaves
+  the `Output:` path out.
+- `incidents-detected-synthetic.txt`: the same listing with the state changed to
+  `detected` (synthetic - there was no open incident to record).
+- `incidents-none-detected.txt`: the answer for `--state detected` with nothing in it.
+- `proc-uptime.txt`, `proc-boot-id.txt`: `/proc/uptime`, `/proc/sys/kernel/random/boot_id`;
+  `proc-stat-excerpt.txt`: the `btime` line of `/proc/stat` (the CPU lines shortened).
+  The backend cannot read these itself (`ProcSubset=pid`), `host.status` does.
+
+`../updates/checkupdates.txt`: `checkupdates` stdout with 44 pending updates (exit 0; exit 2
+means none, anything else is an error), the same as the agent user and as the operator.

@@ -45,8 +45,10 @@ fixtures that pin the behaviour down.
                                 ├─ SOUL.md "Operating rules" (loaded on every run)
                                 ├─ plugin agentcards → publish_water_card → cards/events.jsonl
                                 └─ cron scheduler
-                                     └─ balaton-water (no-agent, 3×/day) → scripts/water_level.py
-                                          └─ public lake gauge table → validate → cards/events.jsonl
+                                     ├─ balaton-water (no-agent, 3×/day) → scripts/water_level.py
+                                     │    └─ public lake gauge table → validate → cards/events.jsonl
+                                     └─ arch-updates (no-agent, daily 07:15) → scripts/updates_check.py
+                                          └─ checkupdates → validate → cards/events.jsonl
                                                           ⇅ HTTP, 127.0.0.1
                               llama-server  (user: <operator>, 127.0.0.1:8080)
                                    Qwen3.8-27B UD-IQ4_XS · 64K context · 1 slot · RTX 4070 SUPER + RTX 3050
@@ -56,7 +58,7 @@ fixtures that pin the behaviour down.
 |---|---|---|---|
 | `llama-server` | operator user | `127.0.0.1:8080` | systemd **user** unit, linger |
 | Hermes gateway + API server | dedicated `agent` user | `127.0.0.1:8642` | systemd user unit + drop-in, linger |
-| `balaton-water` job | `agent` (inside the gateway's scheduler) | – | Hermes cron, `--no-agent` |
+| `balaton-water`, `arch-updates` jobs | `agent` (inside the gateway's scheduler) | – | Hermes cron, `--no-agent` |
 | `delve-backend` | system user `delve` | `127.0.0.1:8700`; tailnet via `tailscale serve` | system unit (`systemd/delve-backend.service`) |
 | phone client | – | – | planned |
 
@@ -108,9 +110,11 @@ etc/
 hermes/
   SOUL.md                   identity + "Operating rules"
   config.fragments.yaml     curated, secret-free excerpt of the agent's config.yaml
-  cron/balaton-water.sh     idempotent creation of the cron job
+  cron/balaton-water.sh     idempotent creation of the water-level cron job
+  cron/arch-updates.sh      idempotent creation of the package-update cron job
   plugins/agentcards/       Hermes plugin: card schema, validator, JSONL store, tool
-  scripts/water_level.py    no-agent cron script (stdlib only)
+  scripts/water_level.py    no-agent cron script: lake gauge → `water` card (stdlib only)
+  scripts/updates_check.py  no-agent cron script: checkupdates → `updates` card (stdlib only)
 ops/
   config-check.py           dump / verify the live config against the fragment
   deny-check.sh             run the deny matrix as the agent user
@@ -149,8 +153,9 @@ This is a record of a working setup, not a turnkey installer. Paths use
 6. **Plugin:** copy `hermes/plugins/agentcards/` to `~agent/.hermes/plugins/`,
    `hermes plugins enable agentcards`, restart the gateway.
 7. **Behavioural rules:** `hermes/SOUL.md` → `~agent/.hermes/SOUL.md`.
-8. **Cron:** `hermes/scripts/water_level.py` → `~agent/.hermes/scripts/`, then
-   `sh hermes/cron/balaton-water.sh` as `agent`.
+8. **Cron:** `hermes/scripts/water_level.py` and `hermes/scripts/updates_check.py` →
+   `~agent/.hermes/scripts/`, then `sh hermes/cron/balaton-water.sh` and
+   `sh hermes/cron/arch-updates.sh` as `agent` (the latter needs `pacman-contrib`).
 9. **Privileges:** copy `site.env.example` to `site.env`, fill in the disk ids, then
    ```sh
    bin/render-sudoers > /tmp/agent.sudoers && sudo visudo -cf /tmp/agent.sudoers \
@@ -189,8 +194,11 @@ This is a record of a working setup, not a turnkey installer. Paths use
     log says `"cards ingested"`.
 16. **Privileged helper:** the backend's unit has no capabilities, no devices and its own
     user namespace, so `sudo` and `nvidia-smi` do not work from it. A root helper with fixed
-    verbs (`llama.status|start|stop`, `hermes.status`, `gpu.status`) answers one JSON line
-    per connection on `/run/delve-helper.sock` (group `delve`, 0660):
+    verbs (`llama.status|start|stop`, `hermes.status`, `gpu.status`, `host.status`,
+    `agent.incidents`) answers one JSON line per connection on `/run/delve-helper.sock`
+    (group `delve`, 0660). `agent.incidents` runs `hermes cron incidents` in the agent's user
+    manager (`systemd-run --user -M agent@`, as `systemctl` reaches it), so `HERMES_BIN` in
+    `/etc/delve/helper.env` has to name the agent's `hermes` (`command -v hermes` as `agent`):
     ```sh
     sudo install -D -m 0755 bin/delve-helper /usr/local/lib/delve/delve-helper
     sudo install -m 0644 etc/delve/helper.env.example /etc/delve/helper.env   # set LLAMA_USER
@@ -210,11 +218,12 @@ This is a record of a working setup, not a turnkey installer. Paths use
 | Test | Where | What it proves |
 |---|---|---|
 | `tests/test_agentcards.py` | CI + host | plugin tool: validation, event building, JSONL store (temp dir) |
-| `tests/test_delve_helper.py` | CI + host | privileged helper: request parsing, verb whitelist, exact commands, `systemctl show` / `nvidia-smi` parsing on the samples in `tests/fixtures/system/` |
+| `tests/test_delve_helper.py` | CI + host | privileged helper: request parsing, verb whitelist, exact commands, `systemctl show` / `nvidia-smi` / `hermes cron incidents` / `/proc` parsing on the samples in `tests/fixtures/system/` |
+| `tests/test_updates_check.py` | CI + host | `checkupdates` parser on a real 44-package output, `updates` payload validator |
 | `tests/test_water_schema.py` | CI + host | `water` payload validator: ranges, types, time window, unknown fields |
 | `tests/test_water_level.py` | CI + host | gauge table parser against the synthetic fixture + 13 malformed variants |
 | fixture reproducibility | CI | `make_tohid_synthetic.py` regenerates a byte-identical fixture |
-| script dry-run | CI | `water_level.py --dry-run` produces a valid v1 `water` event |
+| script dry-run | CI | `water_level.py --dry-run` and `updates_check.py --dry-run` produce valid v1 `water` / `updates` events |
 | gitleaks (push range; full history weekly and on demand) | CI | no secrets in any commit |
 | `ops/deny-check.sh` → `tests/deny-matrix.py` | host | 19 commands × expected outcome through Hermes' own matcher (`pass` / `appr` / `deny` / `hard`) |
 | `tests/lib.sh` | host | replay of the API protocol cases (run, approve, deny, timeout, stop, sessions) |
@@ -224,7 +233,7 @@ This is a record of a working setup, not a turnkey installer. Paths use
 The offline tests use only the standard library and run from any directory:
 
 ```sh
-for t in test_water_level test_water_schema test_agentcards test_delve_helper; do python3 -I tests/$t.py; done
+for t in test_water_level test_water_schema test_agentcards test_delve_helper test_updates_check; do python3 -I tests/$t.py; done
 ```
 
 The on-host tests need the live Hermes install (its Python and modules) or the running

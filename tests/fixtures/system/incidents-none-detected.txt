@@ -1,0 +1,2 @@
+No cron failure incidents recorded.
+  (filtered by state 'detected')

@@ -53,7 +53,7 @@ jobs:
         working-directory: /tmp
         run: |
           set -e
-          for t in test_water_level test_water_schema test_agentcards test_delve_helper; do
+          for t in test_water_level test_water_schema test_agentcards test_delve_helper test_updates_check; do
             echo "::group::$t"
             python -I "$GITHUB_WORKSPACE/tests/$t.py"
             echo "::endgroup::"
@@ -72,3 +72,6 @@ jobs:
           python -I hermes/scripts/water_level.py --file /tmp/tohid.html \
             --dry-run --force --state "$HERMES_HOME/state.json" | tee /tmp/ev.json
           python -I -c "import json; e=json.load(open('/tmp/ev.json')); assert e['type']=='water' and e['payload']['level_cm']==55, e; print('event ok', e['id'])"
+          python -I hermes/scripts/updates_check.py --file tests/fixtures/updates/checkupdates.txt \
+            --dry-run | tee /tmp/ev-updates.json
+          python -I -c "import json; e=json.load(open('/tmp/ev-updates.json')); assert e['type']=='updates' and e['payload']['count']==44, e; print('event ok', e['id'])"
