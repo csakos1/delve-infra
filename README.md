@@ -96,12 +96,14 @@ wrong thing and puts the boundary where it cannot be talked around:
 ```
 bin/
   delve-env                 writes /etc/delve/env from a development env file
+  delve-helper              root helper for the backend: fixed verbs over a unix socket
   render-sudoers            fills etc/sudoers.d/agent.template from site.env, checks disks exist
   wait-llama.sh             ExecStartPre: wait up to 120 s for llama-server /health
 etc/
   gai.conf.fragment         prefer IPv4 in getaddrinfo()
   ssh/sshd_config.d/        key-only SSH
   sysusers.d/delve.conf     the backend's system user
+  delve/helper.env.example  users and units the helper controls
   sudoers.d/agent.template  smartctl whitelist with @DISK_n@ placeholders
 hermes/
   SOUL.md                   identity + "Operating rules"
@@ -116,12 +118,14 @@ ops/
 systemd/
   llama-server.service      user unit for the model server
   delve-backend.service     system unit for the backend, hardened (loopback only)
+  delve-backend.service.d/  drop-ins: fcm.conf (outbound HTTPS), cards.conf (card store)
+  delve-helper.socket, delve-helper@.service   socket-activated helper, one request each
   hermes-gateway.override.conf  drop-in for the Hermes-generated gateway unit
   reference/                the generated unit, for reference only (not edited)
 tests/
   test_*.py                 offline, stdlib-only tests (run in CI)
   deny-matrix.py, lib.sh, toolcall_test.py, longctx_test.py   on-host tests
-  fixtures/                 recorded API protocol, runs, cards, toolsets (sanitized);
+  fixtures/                 recorded API protocol, runs, cards, toolsets, system samples (sanitized);
                             synthetic gauge table + its generator
 site.env.example            host-specific values (disk ids) – copy to site.env
 ```
@@ -183,13 +187,30 @@ This is a record of a working setup, not a turnkey installer. Paths use
     install `systemd/delve-backend.service.d/cards.conf` →
     `/etc/systemd/system/delve-backend.service.d/`, `daemon-reload`, restart the backend; its
     log says `"cards ingested"`.
-16. **Reboot without logging in**, connect over SSH, run `ops/post-boot-check.sh`.
+16. **Privileged helper:** the backend's unit has no capabilities, no devices and its own
+    user namespace, so `sudo` and `nvidia-smi` do not work from it. A root helper with fixed
+    verbs (`llama.status|start|stop`, `hermes.status`, `gpu.status`) answers one JSON line
+    per connection on `/run/delve-helper.sock` (group `delve`, 0660):
+    ```sh
+    sudo install -D -m 0755 bin/delve-helper /usr/local/lib/delve/delve-helper
+    sudo install -m 0644 etc/delve/helper.env.example /etc/delve/helper.env   # set LLAMA_USER
+    sudo install -m 0644 systemd/delve-helper.socket systemd/delve-helper@.service /etc/systemd/system/
+    sudo systemctl daemon-reload && sudo systemctl enable --now delve-helper.socket
+    sudo delve helper gpu.status      # from delve-backend: connects as the delve user
+    ```
+    Each request is one `delve-helper@….service` instance; its journal line is
+    `verb=… result=… ms=…` (`journalctl -u 'delve-helper@*' -n 20`). If a verb fails with
+    `permission denied` / `Operation not permitted`, run the same request without the
+    unit's hardening to tell the two apart:
+    `echo '{"verb":"llama.status"}' | sudo systemd-run --pipe --wait -q -p EnvironmentFile=/etc/delve/helper.env /usr/bin/python3 -I /usr/local/lib/delve/delve-helper`.
+17. **Reboot without logging in**, connect over SSH, run `ops/post-boot-check.sh`.
 
 ## Tests
 
 | Test | Where | What it proves |
 |---|---|---|
 | `tests/test_agentcards.py` | CI + host | plugin tool: validation, event building, JSONL store (temp dir) |
+| `tests/test_delve_helper.py` | CI + host | privileged helper: request parsing, verb whitelist, exact commands, `systemctl show` / `nvidia-smi` parsing on the samples in `tests/fixtures/system/` |
 | `tests/test_water_schema.py` | CI + host | `water` payload validator: ranges, types, time window, unknown fields |
 | `tests/test_water_level.py` | CI + host | gauge table parser against the synthetic fixture + 13 malformed variants |
 | fixture reproducibility | CI | `make_tohid_synthetic.py` regenerates a byte-identical fixture |
@@ -203,7 +224,7 @@ This is a record of a working setup, not a turnkey installer. Paths use
 The offline tests use only the standard library and run from any directory:
 
 ```sh
-for t in test_water_level test_water_schema test_agentcards; do python3 -I tests/$t.py; done
+for t in test_water_level test_water_schema test_agentcards test_delve_helper; do python3 -I tests/$t.py; done
 ```
 
 The on-host tests need the live Hermes install (its Python and modules) or the running

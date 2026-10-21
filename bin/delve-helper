@@ -1,0 +1,325 @@
+#!/usr/bin/python3 -I
+"""Privileged helper for the Delve backend (one request per connection).
+
+Socket-activated by `delve-helper.socket` (Accept=yes): stdin and stdout are the
+connection, stderr goes to the journal. The backend runs fully confined (PrivateUsers,
+no capabilities, no devices), so the few things it needs root or another user for go
+through here, as fixed verbs without arguments:
+
+    llama.status  llama.start  llama.stop  hermes.status  gpu.status
+
+Request:  one JSON line  {"verb": "<verb>"}                       (at most 1 KiB)
+Response: one JSON line  {"ok": true, "verb": "<verb>", "data": {...}}
+                     or  {"ok": false, "error": "<code>", "message": "<text>"}
+
+Error codes: bad_request, unknown_verb, unit_not_found, failed, timeout.
+
+Settings come from the environment (`/etc/delve/helper.env`, see
+`etc/delve/helper.env.example`): LLAMA_USER, LLAMA_UNIT, AGENT_USER, HERMES_UNIT.
+Only the standard library is used; no shell is involved.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from collections.abc import Callable, Sequence
+from typing import Any
+
+MAX_REQUEST = 1024
+READ_TIMEOUT_S = 5
+SHOW_TIMEOUT_S = 10
+CONTROL_TIMEOUT_S = 25
+GPU_TIMEOUT_S = 10
+
+SYSTEMCTL = "/usr/bin/systemctl"
+NVIDIA_SMI = "/usr/bin/nvidia-smi"
+
+CHILD_ENV = {
+    "PATH": "/usr/bin:/bin",
+    "LANG": "C.UTF-8",
+    "SYSTEMD_PAGER": "",
+    "SYSTEMD_COLORS": "0",
+}
+
+USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
+UNIT_RE = re.compile(r"[A-Za-z0-9_.@-]{1,128}")
+
+SHOW_PROPS = (
+    "LoadState",
+    "ActiveState",
+    "SubState",
+    "Result",
+    "ActiveEnterTimestamp",
+    "InactiveEnterTimestamp",
+    "MainPID",
+    "NRestarts",
+)
+
+GPU_FIELDS = (
+    "index",
+    "name",
+    "temperature.gpu",
+    "memory.used",
+    "memory.total",
+    "utilization.gpu",
+    "power.draw",
+    "power.limit",
+)
+
+
+class HelperError(Exception):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+Runner = Callable[[Sequence[str], float], "subprocess.CompletedProcess[str]"]
+
+
+def _run(argv: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            list(argv),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=CHILD_ENV,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise HelperError("timeout", f"{argv[0]} did not finish in {timeout:g} s") from exc
+    except OSError as exc:
+        raise HelperError("failed", f"{argv[0]}: {exc.strerror or exc}") from exc
+
+
+RUN: Runner = _run  # replaced in tests
+
+
+def settings(env: dict[str, str] | None = None) -> dict[str, str]:
+    env = os.environ if env is None else env
+    out = {
+        "llama_user": env.get("LLAMA_USER", ""),
+        "llama_unit": env.get("LLAMA_UNIT", "llama-server"),
+        "agent_user": env.get("AGENT_USER", "agent"),
+        "hermes_unit": env.get("HERMES_UNIT", "hermes-gateway"),
+    }
+    for key in ("llama_user", "agent_user"):
+        if not USER_RE.fullmatch(out[key]):
+            raise HelperError("failed", f"{key.upper()} is not set to a valid user name")
+    for key in ("llama_unit", "hermes_unit"):
+        if not UNIT_RE.fullmatch(out[key]):
+            raise HelperError("failed", f"{key.upper()} is not a valid unit name")
+    return out
+
+
+def _first_line(text: str) -> str:
+    for line in text.splitlines():
+        if line.strip():
+            return line.strip()[:200]
+    return ""
+
+
+# --- systemd ------------------------------------------------------------------------
+
+
+def _timestamp(value: str) -> int | None:
+    """`--timestamp=unix` values look like `@1792537434`; unset ones are empty."""
+    value = value.strip()
+    if not value.startswith("@"):
+        return None
+    try:
+        ts = int(value[1:])
+    except ValueError:
+        return None
+    return ts if ts > 0 else None
+
+
+def _int(value: str | None) -> int | None:
+    try:
+        return int(value) if value not in (None, "") else None
+    except ValueError:
+        return None
+
+
+def parse_show(text: str) -> dict[str, Any]:
+    """`systemctl show -p …` key=value lines -> the unit state the backend uses."""
+    props: dict[str, str] = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            props[key.strip()] = value.strip()
+    if props.get("LoadState") == "not-found":
+        raise HelperError("unit_not_found", "the unit does not exist for that user")
+    if "ActiveState" not in props:
+        raise HelperError("failed", "systemctl show returned no ActiveState")
+    pid = _int(props.get("MainPID"))
+    return {
+        "active_state": props["ActiveState"],
+        "sub_state": props.get("SubState") or None,
+        "result": props.get("Result") or None,
+        "active_since": _timestamp(props.get("ActiveEnterTimestamp", "")),
+        "inactive_since": _timestamp(props.get("InactiveEnterTimestamp", "")),
+        "main_pid": pid if pid else None,
+        "restarts": _int(props.get("NRestarts")),
+    }
+
+
+def _show(user: str, unit: str) -> dict[str, Any]:
+    argv = [
+        SYSTEMCTL,
+        "--user",
+        "-M",
+        f"{user}@",
+        "show",
+        "--timestamp=unix",
+        unit,
+        "-p",
+        ",".join(SHOW_PROPS),
+    ]
+    p = RUN(argv, SHOW_TIMEOUT_S)
+    if p.returncode != 0:
+        raise HelperError("failed", _first_line(p.stderr) or f"systemctl exit {p.returncode}")
+    return parse_show(p.stdout)
+
+
+def _control(user: str, unit: str, action: str) -> dict[str, Any]:
+    argv = [SYSTEMCTL, "--user", "-M", f"{user}@", action, unit]
+    p = RUN(argv, CONTROL_TIMEOUT_S)
+    if p.returncode != 0:
+        raise HelperError("failed", _first_line(p.stderr) or f"systemctl exit {p.returncode}")
+    return _show(user, unit)
+
+
+# --- nvidia-smi ---------------------------------------------------------------------
+
+
+def _num(value: str) -> float | None:
+    value = value.strip()
+    if not value or value.startswith("["):  # [N/A], [Not Supported], [Unknown Error]
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def parse_gpus(text: str) -> list[dict[str, Any]]:
+    gpus: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        cols = [c.strip() for c in line.split(",")]
+        if len(cols) != len(GPU_FIELDS):
+            raise HelperError("failed", f"nvidia-smi: unexpected line with {len(cols)} fields")
+        index = _num(cols[0])
+        mem_used, mem_total = _num(cols[3]), _num(cols[4])
+        gpus.append(
+            {
+                "index": int(index) if index is not None else len(gpus),
+                "name": cols[1],
+                "temp_c": _num(cols[2]),
+                "mem_used_mib": int(mem_used) if mem_used is not None else None,
+                "mem_total_mib": int(mem_total) if mem_total is not None else None,
+                "util_pct": _num(cols[5]),
+                "power_w": _num(cols[6]),
+                "power_limit_w": _num(cols[7]),
+            }
+        )
+    return gpus
+
+
+def gpu_status() -> dict[str, Any]:
+    argv = [
+        NVIDIA_SMI,
+        "--query-gpu=" + ",".join(GPU_FIELDS),
+        "--format=csv,noheader,nounits",
+    ]
+    p = RUN(argv, GPU_TIMEOUT_S)
+    if p.returncode != 0:
+        msg = _first_line(p.stdout) or _first_line(p.stderr) or f"exit {p.returncode}"
+        raise HelperError("failed", f"nvidia-smi: {msg}")
+    return {"gpus": parse_gpus(p.stdout)}
+
+
+# --- dispatch -----------------------------------------------------------------------
+
+
+def handle(verb: str, env: dict[str, str] | None = None) -> dict[str, Any]:
+    if verb == "gpu.status":
+        return gpu_status()
+    cfg = settings(env)
+    if verb == "llama.status":
+        return _show(cfg["llama_user"], cfg["llama_unit"])
+    if verb == "llama.start":
+        return _control(cfg["llama_user"], cfg["llama_unit"], "start")
+    if verb == "llama.stop":
+        return _control(cfg["llama_user"], cfg["llama_unit"], "stop")
+    if verb == "hermes.status":
+        return _show(cfg["agent_user"], cfg["hermes_unit"])
+    raise HelperError("unknown_verb", "unknown verb")
+
+
+VERBS = ("llama.status", "llama.start", "llama.stop", "hermes.status", "gpu.status")
+
+
+def parse_request(raw: bytes) -> str:
+    if len(raw) > MAX_REQUEST:
+        raise HelperError("bad_request", "request too long")
+    try:
+        req = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise HelperError("bad_request", "request is not a JSON line") from exc
+    if not isinstance(req, dict) or set(req) != {"verb"} or not isinstance(req["verb"], str):
+        raise HelperError("bad_request", 'expected {"verb": "<verb>"}')
+    if req["verb"] not in VERBS:
+        raise HelperError("unknown_verb", "unknown verb")
+    return req["verb"]
+
+
+def respond(raw: bytes, env: dict[str, str] | None = None) -> tuple[dict[str, Any], str]:
+    """One request -> (response object, verb for the log)."""
+    verb = "?"
+    try:
+        verb = parse_request(raw)
+        return {"ok": True, "verb": verb, "data": handle(verb, env)}, verb
+    except HelperError as exc:
+        return {"ok": False, "error": exc.code, "message": exc.message}, verb
+
+
+def _timeout(_signum: int, _frame: object) -> None:
+    raise TimeoutError
+
+
+def main() -> int:
+    started = time.monotonic()
+    signal.signal(signal.SIGALRM, _timeout)
+    signal.alarm(READ_TIMEOUT_S)
+    try:
+        raw = sys.stdin.buffer.readline(MAX_REQUEST + 1)
+    except TimeoutError:
+        raw = b""
+    finally:
+        signal.alarm(0)
+    if not raw.strip():
+        out: dict[str, Any] = {"ok": False, "error": "bad_request", "message": "no request"}
+        verb = "?"
+    else:
+        out, verb = respond(raw.strip())
+    sys.stdout.write(json.dumps(out, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+    ms = round((time.monotonic() - started) * 1000)
+    status = "ok" if out["ok"] else out["error"]
+    print(f"verb={verb} result={status} ms={ms}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -7,7 +7,8 @@
 # Later steps add drop-ins instead of editing this file:
 #   B2    cards:  BindReadOnlyPaths=/home/agent/.hermes/cards:/run/delve/cards - delve-backend.service.d/cards.conf
 #   B1    FCM:    outbound HTTPS to Google (IPAddressDeny below) - delve-backend.service.d/fcm.conf
-#   12/9, 12/11  sudo helpers: NoNewPrivileges=no and the matching SystemCallFilter
+#   B3    system: no change here - privileged verbs go through delve-helper.socket
+#         (/run/delve-helper.sock, group delve); this unit keeps sudo and devices out
 
 [Unit]
 Description=Delve backend

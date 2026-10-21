@@ -17,6 +17,9 @@ curl -s -m 2 127.0.0.1:8700/api/v1/meta \
   | python3 -Ic 'import json,sys; m=json.load(sys.stdin); print("revision:", m.get("revision"), "api_revision:", m.get("api_revision"))' \
   2>/dev/null || echo "revision: ? (meta unreachable)"
 tailscale serve status 2>&1 | head -4
+echo "=== delve-helper ==="
+systemctl is-active delve-helper.socket
+command -v delve >/dev/null && sudo delve helper llama.status 2>&1 | head -c 300; echo
 echo "=== agent: gateway (s boot óta) ==="
 sudo machinectl shell agent@ /usr/bin/bash -lc '
   export SYSTEMD_PAGER=

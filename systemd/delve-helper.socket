@@ -1,0 +1,15 @@
+# Delve privileged helper: the backend (group delve) connects, one request per connection.
+# Install: /etc/systemd/system/, `systemctl enable --now delve-helper.socket`.
+[Unit]
+Description=Delve privileged helper socket
+
+[Socket]
+ListenStream=/run/delve-helper.sock
+SocketUser=root
+SocketGroup=delve
+SocketMode=0660
+Accept=yes
+MaxConnections=8
+
+[Install]
+WantedBy=sockets.target

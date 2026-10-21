@@ -1,0 +1,8 @@
+LoadState=loaded
+ActiveState=inactive
+SubState=dead
+Result=success
+ActiveEnterTimestamp=@1792535325
+InactiveEnterTimestamp=@1792535668
+MainPID=0
+NRestarts=0
