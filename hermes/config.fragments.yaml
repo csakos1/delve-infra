@@ -17,6 +17,10 @@ model:
   base_url: http://127.0.0.1:8080/v1
   api_key: "<redacted>"          # llama-server has no auth; any value works
   api_mode: chat_completions
+  # Delve B6: the model sees images itself (mmproj on llama-server). Without this Hermes
+  # cannot tell that a custom model has vision and has every image described as text by
+  # a separate auxiliary call first (slow, timed out on screenshots).
+  supports_vision: true
 
 # Legacy provider format (hermes doctor suggests migrating to `providers:`).
 # The context-length pin must match llama-server's -c 65536 with -np 1.

@@ -105,6 +105,7 @@ etc/
   gai.conf.fragment         prefer IPv4 in getaddrinfo()
   ssh/sshd_config.d/        key-only SSH
   sysusers.d/delve.conf     the backend's system user
+  tmpfiles.d/delve-inbox.conf  the attachment inbox: 2750 delve:agent
   delve/helper.env.example  users and units the helper controls
   sudoers.d/agent.template  smartctl whitelist with @DISK_n@ placeholders
 hermes/
@@ -122,7 +123,8 @@ ops/
 systemd/
   llama-server.service      user unit for the model server
   delve-backend.service     system unit for the backend, hardened (loopback only)
-  delve-backend.service.d/  drop-ins: fcm.conf (outbound HTTPS), cards.conf (card store)
+  delve-backend.service.d/  drop-ins: fcm.conf (outbound HTTPS), cards.conf (card store),
+                            inbox.conf (attachment inbox)
   delve-helper.socket, delve-helper@.service   socket-activated helper, one request each
   hermes-gateway.override.conf  drop-in for the Hermes-generated gateway unit
   reference/                the generated unit, for reference only (not edited)
@@ -211,7 +213,22 @@ This is a record of a working setup, not a turnkey installer. Paths use
     `permission denied` / `Operation not permitted`, run the same request without the
     unit's hardening to tell the two apart:
     `echo '{"verb":"llama.status"}' | sudo systemd-run --pipe --wait -q -p EnvironmentFile=/etc/delve/helper.env /usr/bin/python3 -I /usr/local/lib/delve/delve-helper`.
-17. **Reboot without logging in**, connect over SSH, run `ops/post-boot-check.sh`.
+17. **Attachments:** images reach the model natively only with `model.supports_vision: true`
+    in the agent's config (in `hermes/config.fragments.yaml`; restart the gateway after
+    adding it). Files go to an inbox the backend writes and the agent reads: a setgid
+    directory owned by `delve` with the agent's own group, so neither a new group nor a new
+    login of `agent` is needed:
+    ```sh
+    sudo install -m 0644 etc/tmpfiles.d/delve-inbox.conf /etc/tmpfiles.d/
+    sudo systemd-tmpfiles --create delve-inbox.conf
+    sudo install -m 0644 systemd/delve-backend.service.d/inbox.conf /etc/systemd/system/delve-backend.service.d/
+    sudo systemctl daemon-reload && sudo systemctl restart delve-backend
+    sudo stat -c '%n %U:%G %A' /var/lib/delve-inbox      # delve:agent drwxr-s---
+    ```
+    The backend writes `<id>/<name>` (0750/0640 through its `UMask=0027`; inside its user
+    namespace the group shows as 65534, on the host it is `agent`) and names the path in the
+    run's instructions; the agent reads it with `read_file`, without approval.
+18. **Reboot without logging in**, connect over SSH, run `ops/post-boot-check.sh`.
 
 ## Tests
 

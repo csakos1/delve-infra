@@ -22,6 +22,7 @@ systemctl is-active delve-helper.socket
 command -v delve >/dev/null && sudo delve helper llama.status 2>&1 | head -c 300; echo
 command -v delve >/dev/null && sudo delve helper host.status 2>&1 | head -c 300; echo
 command -v delve >/dev/null && sudo delve helper agent.incidents 2>&1 | head -c 300; echo
+echo "=== attachment inbox ==="; sudo stat -c '%n %U:%G %A' /var/lib/delve-inbox
 echo "=== agent: gateway (s boot óta) ==="
 sudo machinectl shell agent@ /usr/bin/bash -lc '
   export SYSTEMD_PAGER=

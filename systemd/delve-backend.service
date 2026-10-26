@@ -9,6 +9,7 @@
 #   B1    FCM:    outbound HTTPS to Google (IPAddressDeny below) - delve-backend.service.d/fcm.conf
 #   B3    system: no change here - privileged verbs go through delve-helper.socket
 #         (/run/delve-helper.sock, group delve); this unit keeps sudo and devices out
+#   B6    inbox:  ReadWritePaths=-/var/lib/delve-inbox (attachment files) - delve-backend.service.d/inbox.conf
 
 [Unit]
 Description=Delve backend
