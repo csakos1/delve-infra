@@ -1,0 +1,27 @@
+{
+ "body": {
+  "films": [
+   {
+    "id": "1001s2r",
+    "name": "Kitalált Film Egy",
+    "length": 101,
+    "link": "https://www.cinemacity.hu/films/kitalalt-film-egy/1001s2r",
+    "releaseDate": "2026-10-22T00:00:00",
+    "attributeIds": [
+     "2d",
+     "original-lang-en"
+    ]
+   },
+   {
+    "id": "1002s2r",
+    "name": "Kitalált Film Kettő",
+    "length": 95,
+    "link": "https://www.cinemacity.hu/films/kitalalt-film-ketto/1002s2r",
+    "releaseDate": "2026-11-05T00:00:00",
+    "attributeIds": [
+     "3d"
+    ]
+   }
+  ]
+ }
+}

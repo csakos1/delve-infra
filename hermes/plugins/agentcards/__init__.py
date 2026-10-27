@@ -1,10 +1,11 @@
-"""agentcards – kártya-publikáló toolok (publish_*_card) a telefonos dashboardhoz."""
+"""agentcards – Delve tools for the agent: card publishing (publish_*_card), page reading
+(page_fetch) and watchers (watch_manage)."""
 from __future__ import annotations
 
 import json
 import logging
 
-from . import schemas, store
+from . import schemas, store, watch_tools
 
 logger = logging.getLogger(__name__)
 TOOLSET = "agentcards"
@@ -40,4 +41,21 @@ def register(ctx):
         schema=schemas.PUBLISH_WATER_CARD_SCHEMA,
         handler=handle_publish_water_card,
         emoji="🌊",
+    )
+
+    ctx.register_tool(
+        name="page_fetch",
+        toolset=TOOLSET,
+        schema=watch_tools.PAGE_FETCH_SCHEMA,
+        handler=watch_tools.handle_page_fetch,
+        emoji="📄",
+    )
+
+    manager = watch_tools.WatchManager()
+    ctx.register_tool(
+        name="watch_manage",
+        toolset=TOOLSET,
+        schema=watch_tools.WATCH_MANAGE_SCHEMA,
+        handler=manager.handle,
+        emoji="👀",
     )
