@@ -55,7 +55,7 @@ network:
 # --- Plugins / tools -------------------------------------------------------------
 plugins:
   enabled:
-    - agentcards                 # publish_water_card + shared card schema/store
+    - agentcards                 # publish_water_card, page_fetch, watch_manage + shared card schema/store
   disabled: []
 
 # Blank Slate install: only the toolsets actually needed.
@@ -68,7 +68,15 @@ platform_toolsets:
 
 tools:
   tool_search:
-    enabled: "off"               # all 11 tools eager: 1 tool round instead of 3
+    enabled: "off"               # all 13 tools eager: 1 tool round instead of 3
+
+# --- Context (D-42) ------------------------------------------------------------------
+# compress at 75% of the 64K window (Hermes floors the ratio for windows below 512K)
+# instead of failing the run when the window is full
+compression:
+  enabled: true
+# read_file returns at most this many characters per call (Hermes default 100000 ≈ 30K tokens)
+file_read_max_chars: 16000
 
 # --- Approvals ---------------------------------------------------------------------
 # manual: the "smart" mode's auxiliary LLM call would occupy the single

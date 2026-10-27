@@ -32,6 +32,8 @@ DUMP_PATHS = [
     "approvals",
     "checkpoints",
     "tools.tool_search",
+    "compression.enabled",
+    "file_read_max_chars",
 ]
 
 SECRET_KEY = re.compile(r"(key|token|secret|password)", re.I)
