@@ -40,3 +40,8 @@ Timings seen: `systemctl --user -M <user>@ start llama-server` → `/health` 200
 
 `../updates/checkupdates.txt`: `checkupdates` stdout with 44 pending updates (exit 0; exit 2
 means none, anything else is an error), the same as the agent user and as the operator.
+
+`cron-jobs.json` (#27, W0): the agent's `~/.hermes/cron/jobs.json` (Hermes v0.22.2) with the
+two real no-agent jobs; the W0 probe job is turned into a paused `watch:` job, and an
+invented agent-mode job (with a prompt and a long error) checks that `agent.cron.list` never
+returns the prompt and clips the error.

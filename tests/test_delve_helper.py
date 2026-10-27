@@ -309,6 +309,86 @@ class Incidents(Base):
                 self.assertIn("HERMES_BIN", r["message"])
 
 
+CRON_LIST_ARGV = (
+    "/usr/bin/systemd-run", "--user", "-M", "agent@", "--pipe", "--wait", "--quiet",
+    "--collect", "--", "/usr/bin/cat", "--", "/home/agent/.hermes/cron/jobs.json",
+)
+
+
+def cron_argv(action: str, job: str, wait: bool = True) -> tuple[str, ...]:
+    head = ("/usr/bin/systemd-run", "--user", "-M", "agent@")
+    mid = ("--pipe", "--wait", "--quiet", "--collect", "--") if wait else ("--quiet", "--collect", "--")
+    return head + mid + ("/home/agent/.local/bin/hermes", "cron", action, job)
+
+
+class Cron(Base):
+    def ask_env(self, raw: str, env: dict[str, str] = INC_ENV) -> dict:
+        out, _ = helper.respond(raw.encode(), env)
+        return json.loads(json.dumps(out))
+
+    def test_list(self) -> None:
+        self.use({CRON_LIST_ARGV: (0, fixture("cron-jobs.json"), "")})
+        r = self.ask_env('{"verb": "agent.cron.list"}')
+        self.assertTrue(r["ok"], r)
+        jobs = {j["name"]: j for j in r["data"]["jobs"]}
+        self.assertEqual(set(jobs), {"balaton-water", "arch-updates", "watch:rtx-4070-super",
+                                     "agent-mode-sample"})
+        w = jobs["watch:rtx-4070-super"]
+        self.assertEqual((w["id"], w["state"], w["enabled"], w["no_agent"], w["schedule"]),
+                         ("5a1f0c2e9b44", "paused", False, True, "15 8,13,19 * * *"))
+        a = jobs["agent-mode-sample"]
+        self.assertFalse(a["no_agent"])
+        self.assertEqual(len(a["last_error"]), 200)
+        self.assertNotIn("SECRET-LOOKING", json.dumps(r))
+        self.assertNotIn("prompt", a)
+
+    def test_list_missing_file_and_bad_content(self) -> None:
+        self.use({CRON_LIST_ARGV: (1, "", "/usr/bin/cat: /home/agent/.hermes/cron/jobs.json: No such file or directory\n")})
+        self.assertEqual(self.ask_env('{"verb": "agent.cron.list"}')["data"], {"jobs": []})
+        self.use({CRON_LIST_ARGV: (0, "not json", "")})
+        self.assertEqual(self.ask_env('{"verb": "agent.cron.list"}')["error"], "failed")
+
+    def test_list_home_setting(self) -> None:
+        argv = CRON_LIST_ARGV[:-1] + ("/srv/agent/.hermes/cron/jobs.json",)
+        self.use({argv: (0, '{"jobs": []}', "")})
+        r = self.ask_env('{"verb": "agent.cron.list"}', dict(INC_ENV, AGENT_HERMES_HOME="/srv/agent/.hermes"))
+        self.assertEqual(r["data"], {"jobs": []})
+        r = self.ask_env('{"verb": "agent.cron.list"}', dict(INC_ENV, AGENT_HERMES_HOME="/srv/../etc"))
+        self.assertEqual(r["error"], "failed")
+
+    def test_pause_resume_run(self) -> None:
+        fake = self.use({
+            cron_argv("pause", "5a1f0c2e9b44"): (0, "Paused job: watch:rtx (5a1f0c2e9b44)\n", ""),
+            cron_argv("resume", "5a1f0c2e9b44"): (0, "Resumed job\n", ""),
+            cron_argv("run", "5a1f0c2e9b44", wait=False): (0, "", "Running as unit: run-u12.service\n"),
+        })
+        for verb, started in (("pause", False), ("resume", False), ("run", True)):
+            with self.subTest(verb=verb):
+                r = self.ask_env(json.dumps({"verb": f"agent.cron.{verb}", "arg": "5a1f0c2e9b44"}))
+                self.assertTrue(r["ok"], r)
+                self.assertEqual(r["data"], {"job_id": "5a1f0c2e9b44", "action": verb, "started": started})
+        self.assertEqual(len(fake.calls), 3)
+
+    def test_not_found(self) -> None:
+        self.use({cron_argv("pause", "abcdef"): (1, "", "Job not found: abcdef\n")})
+        r = self.ask_env('{"verb": "agent.cron.pause", "arg": "abcdef"}')
+        self.assertEqual(r["error"], "unit_not_found")
+
+    def test_arg_rules(self) -> None:
+        fake = self.use({})
+        for raw in ('{"verb": "agent.cron.pause"}',
+                    '{"verb": "agent.cron.pause", "arg": "--all"}',
+                    '{"verb": "agent.cron.run", "arg": "5A1F0C2E9B44"}',
+                    '{"verb": "agent.cron.run", "arg": "abc"}',
+                    '{"verb": "agent.cron.run", "arg": ["5a1f0c2e9b44"]}',
+                    '{"verb": "agent.cron.run", "arg": "5a1f0c2e9b44", "x": 1}',
+                    '{"verb": "agent.cron.list", "arg": "5a1f0c2e9b44"}',
+                    '{"verb": "gpu.status", "arg": "5a1f0c2e9b44"}'):
+            with self.subTest(raw=raw):
+                self.assertEqual(self.ask_env(raw)["error"], "bad_request")
+        self.assertEqual(fake.calls, [])
+
+
 class Process(unittest.TestCase):
     """The script itself over stdin/stdout, as systemd runs it (no verb that executes)."""
 

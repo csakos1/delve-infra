@@ -4,12 +4,15 @@
 Socket-activated by `delve-helper.socket` (Accept=yes): stdin and stdout are the
 connection, stderr goes to the journal. The backend runs fully confined (PrivateUsers,
 no capabilities, no devices), so the few things it needs root or another user for go
-through here, as fixed verbs without arguments:
+through here, as fixed verbs:
 
     llama.status  llama.start  llama.stop  hermes.status  gpu.status
-    host.status   agent.incidents
+    host.status   agent.incidents  agent.cron.list
+    agent.cron.pause <job id>  agent.cron.resume <job id>  agent.cron.run <job id>
 
 Request:  one JSON line  {"verb": "<verb>"}                       (at most 1 KiB)
+          or, for the verbs that name a job, {"verb": "<verb>", "arg": "<job id>"}
+          (a Hermes job id: 6-32 lowercase hex characters)
 Response: one JSON line  {"ok": true, "verb": "<verb>", "data": {...}}
                      or  {"ok": false, "error": "<code>", "message": "<text>"}
 
@@ -17,7 +20,8 @@ Error codes: bad_request, unknown_verb, unit_not_found, failed, timeout.
 
 Settings come from the environment (`/etc/delve/helper.env`, see
 `etc/delve/helper.env.example`): LLAMA_USER, LLAMA_UNIT, AGENT_USER, HERMES_UNIT,
-HERMES_BIN (only for agent.incidents).
+HERMES_BIN (for the agent.* verbs), AGENT_HERMES_HOME (for agent.cron.list; default
+/home/<AGENT_USER>/.hermes).
 Only the standard library is used; no shell is involved.
 """
 
@@ -39,6 +43,7 @@ SHOW_TIMEOUT_S = 10
 CONTROL_TIMEOUT_S = 25
 GPU_TIMEOUT_S = 10
 AGENT_TIMEOUT_S = 25
+CRON_LIST_MAX = 2 * 1024 * 1024
 
 SYSTEMCTL = "/usr/bin/systemctl"
 SYSTEMD_RUN = "/usr/bin/systemd-run"
@@ -52,6 +57,7 @@ CHILD_ENV = {
     "SYSTEMD_COLORS": "0",
 }
 
+JOB_ID_RE = re.compile(r"[0-9a-f]{6,32}")
 USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
 UNIT_RE = re.compile(r"[A-Za-z0-9_.@-]{1,128}")
 BIN_RE = re.compile(r"(?:/[A-Za-z0-9_.+-]+){1,16}")
@@ -131,6 +137,15 @@ def hermes_bin(env: dict[str, str] | None = None) -> str:
     path = env.get("HERMES_BIN", "")
     if not BIN_RE.fullmatch(path) or "/../" in path + "/" or "/./" in path + "/":
         raise HelperError("failed", "HERMES_BIN is not set to an absolute path")
+    return path
+
+
+def agent_hermes_home(env: dict[str, str] | None = None) -> str:
+    env = os.environ if env is None else env
+    cfg = settings(env)
+    path = env.get("AGENT_HERMES_HOME") or f"/home/{cfg['agent_user']}/.hermes"
+    if not BIN_RE.fullmatch(path) or "/../" in path + "/" or "/./" in path + "/":
+        raise HelperError("failed", "AGENT_HERMES_HOME is not an absolute path")
     return path
 
 
@@ -360,16 +375,87 @@ def agent_incidents(env: dict[str, str] | None = None) -> dict[str, Any]:
     return {"incidents": parse_incidents(p.stdout)}
 
 
+# --- agent cron jobs (watchers: Delve W) ----------------------------------------------
+
+CRON_FIELDS = ("id", "name", "script", "no_agent", "enabled", "state", "next_run_at",
+               "last_run_at", "last_status", "failure_streak", "paused_at")
+
+
+def _in_agent_manager(env: dict[str, str] | None, argv: Sequence[str], wait: bool = True) -> list[str]:
+    cfg = settings(env)
+    head = [SYSTEMD_RUN, "--user", "-M", f"{cfg['agent_user']}@"]
+    head += ["--pipe", "--wait", "--quiet", "--collect", "--"] if wait else ["--quiet", "--collect", "--"]
+    return head + list(argv)
+
+
+def parse_cron_jobs(text: str) -> list[dict[str, Any]]:
+    """~/.hermes/cron/jobs.json -> the job fields the backend shows (never the prompt)."""
+    try:
+        data = json.loads(text)
+        jobs = data["jobs"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise HelperError("failed", "jobs.json: unexpected content") from exc
+    if not isinstance(jobs, list):
+        raise HelperError("failed", "jobs.json: jobs is not a list")
+    out = []
+    for job in jobs:
+        if not isinstance(job, dict) or not isinstance(job.get("id"), str):
+            continue
+        row = {k: job.get(k) for k in CRON_FIELDS}
+        sched = job.get("schedule") if isinstance(job.get("schedule"), dict) else {}
+        row["schedule"] = str(job.get("schedule_display") or sched.get("display") or "")[:80] or None
+        row["no_agent"] = bool(job.get("no_agent"))
+        err = job.get("last_error")
+        row["last_error"] = str(err)[:200] if err else None
+        for k in ("name", "script", "state", "last_status"):
+            if row[k] is not None:
+                row[k] = str(row[k])[:120]
+        out.append(row)
+    return out
+
+
+def agent_cron_list(env: dict[str, str] | None = None) -> dict[str, Any]:
+    path = agent_hermes_home(env) + "/cron/jobs.json"
+    p = RUN(_in_agent_manager(env, ["/usr/bin/cat", "--", path]), AGENT_TIMEOUT_S)
+    if p.returncode != 0:
+        msg = _first_line(p.stderr) or f"exit {p.returncode}"
+        if "No such file" in msg:
+            return {"jobs": []}
+        raise HelperError("failed", f"jobs.json: {msg}")
+    if len(p.stdout) > CRON_LIST_MAX:
+        raise HelperError("failed", "jobs.json: too large")
+    return {"jobs": parse_cron_jobs(p.stdout)}
+
+
+def agent_cron_action(action: str, job_id: str, env: dict[str, str] | None = None) -> dict[str, Any]:
+    """pause/resume wait for Hermes; run is started in the background (a watcher with detail
+    pages can take longer than the helper may run) and reports through its cards."""
+    if not JOB_ID_RE.fullmatch(job_id):
+        raise HelperError("bad_request", "invalid job id")
+    argv = _in_agent_manager(env, [hermes_bin(env), "cron", action, job_id], wait=action != "run")
+    p = RUN(argv, AGENT_TIMEOUT_S)
+    if p.returncode != 0:
+        msg = _first_line(p.stderr) or _first_line(p.stdout) or f"exit {p.returncode}"
+        if "not found" in msg.lower():
+            raise HelperError("unit_not_found", f"no cron job {job_id}")
+        raise HelperError("failed", f"hermes cron {action}: {msg}")
+    return {"job_id": job_id, "action": action, "started": action == "run"}
+
+
 # --- dispatch -----------------------------------------------------------------------
 
 
-def handle(verb: str, env: dict[str, str] | None = None) -> dict[str, Any]:
+def handle(verb: str, env: dict[str, str] | None = None, arg: str | None = None) -> dict[str, Any]:
     if verb == "gpu.status":
         return gpu_status()
     if verb == "host.status":
         return host_status()
     if verb == "agent.incidents":
         return agent_incidents(env)
+    if verb == "agent.cron.list":
+        return agent_cron_list(env)
+    if verb in ARG_VERBS:
+        return agent_cron_action(verb.rsplit(".", 1)[1], arg or "", env)
     cfg = settings(env)
     if verb == "llama.status":
         return _show(cfg["llama_user"], cfg["llama_unit"])
@@ -390,29 +476,42 @@ VERBS = (
     "gpu.status",
     "host.status",
     "agent.incidents",
+    "agent.cron.list",
+    "agent.cron.pause",
+    "agent.cron.resume",
+    "agent.cron.run",
 )
+ARG_VERBS = ("agent.cron.pause", "agent.cron.resume", "agent.cron.run")
 
 
-def parse_request(raw: bytes) -> str:
+def parse_request(raw: bytes) -> tuple[str, str | None]:
     if len(raw) > MAX_REQUEST:
         raise HelperError("bad_request", "request too long")
     try:
         req = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
         raise HelperError("bad_request", "request is not a JSON line") from exc
-    if not isinstance(req, dict) or set(req) != {"verb"} or not isinstance(req["verb"], str):
+    if not isinstance(req, dict) or not isinstance(req.get("verb"), str):
         raise HelperError("bad_request", 'expected {"verb": "<verb>"}')
-    if req["verb"] not in VERBS:
+    verb = req["verb"]
+    if verb not in VERBS:
         raise HelperError("unknown_verb", "unknown verb")
-    return req["verb"]
+    if verb in ARG_VERBS:
+        if set(req) != {"verb", "arg"} or not isinstance(req["arg"], str) \
+                or not JOB_ID_RE.fullmatch(req["arg"]):
+            raise HelperError("bad_request", 'expected {"verb": "<verb>", "arg": "<job id>"}')
+        return verb, req["arg"]
+    if set(req) != {"verb"}:
+        raise HelperError("bad_request", 'expected {"verb": "<verb>"}')
+    return verb, None
 
 
 def respond(raw: bytes, env: dict[str, str] | None = None) -> tuple[dict[str, Any], str]:
     """One request -> (response object, verb for the log)."""
     verb = "?"
     try:
-        verb = parse_request(raw)
-        return {"ok": True, "verb": verb, "data": handle(verb, env)}, verb
+        verb, arg = parse_request(raw)
+        return {"ok": True, "verb": verb, "data": handle(verb, env, arg)}, verb
     except HelperError as exc:
         return {"ok": False, "error": exc.code, "message": exc.message}, verb
 
