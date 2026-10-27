@@ -46,14 +46,15 @@ jobs:
       - name: synthetic fixture is reproducible
         run: |
           python -I tests/fixtures/water/make_tohid_synthetic.py
-          git diff --exit-code -- tests/fixtures/water/
+          python -I tests/fixtures/watch/make_watch_synthetic.py
+          git diff --exit-code -- tests/fixtures/water/ tests/fixtures/watch/
 
       - name: unit tests
         # run from outside the repo to prove the tests are path-independent
         working-directory: /tmp
         run: |
           set -e
-          for t in test_water_level test_water_schema test_agentcards test_delve_helper test_updates_check; do
+          for t in test_water_level test_water_schema test_agentcards test_delve_helper test_updates_check test_watch; do
             echo "::group::$t"
             python -I "$GITHUB_WORKSPACE/tests/$t.py"
             echo "::endgroup::"

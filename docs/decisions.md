@@ -35,7 +35,7 @@ Simpler to reason about than a container with mounted host paths, and it compose
 normal Unix permissions, sudoers and systemd. Docker backend rejected.
 
 **D-08 Blank Slate install; only the needed toolsets** (`file`, `terminal`, `vision`,
-`skills`, `agentcards` → 11 tools). Fewer tools means a smaller prompt and fewer ways
+`skills`, `agentcards` → 11 tools; 13 since `page_fetch` and `watch_manage`, D-39/D-40). Fewer tools means a smaller prompt and fewer ways
 to go wrong.
 
 **D-09 Tool Search off.** With 11 tools, the search/describe bridge cost 2 extra tool
@@ -150,6 +150,53 @@ committed and CI checks that it reproduces the fixture byte for byte.
 **D-37 Collection through a staging directory.** Files from the host are gathered
 outside the repository, scanned as one set, sanitized, and only then installed.
 
+## Watchers and page reading (Delve W)
+
+**D-38 Watchers are no-agent cron jobs; the LLM only sets them up and judges new items.**
+A watcher described in chat ("tell me about new RTX 4070 Super ads under 180k") becomes a
+config file, a generated wrapper script and a Hermes cron job with `--no-agent --deliver
+local`. Each run is deterministic: fetch, parse, mechanical filters (title words, price),
+dedup against a state file, `watch_candidate` / `watch_run` cards. Hermes' own agent-mode
+cron and its `monitor`/`continuity` features are not used: they would call the model
+outside the backend's run queue on the single slot. The free-text condition ("not mined")
+travels in a `watch_def` card and is judged per new item by the backend, through its own
+queue, without thinking and with a JSON schema (W0: 5/5 correct, ~3 s per item).
+
+**D-39 The model fills in a tool call, it does not write the watcher.** `watch_manage`
+validates the definition, test-fetches it (`preview`) before anything is written, creates
+the cron job in-process through Hermes' `tools.cronjob_tools.cronjob` (the entry point of
+the `hermes cron` CLI) and runs the baseline. The `cronjob` toolset stays off (D-08): the
+model cannot create agent-mode jobs. Sources are code with tests: `hardverapro` (listing
+and search pages, ad pages for `fetch_details`), `cinemacity` (the bookable-film list of
+the site's JSON API), `page` (links of any page). At most 20 watchers, at most every 30
+minutes, at most hourly for cron expressions; first run = baseline (already listed items
+are not announced), except for `stop_after_hit` watchers.
+
+**D-40 `page_fetch` instead of the Hermes web toolset.** Hermes' `web_search` /
+`web_extract` need an outside provider (keyed vendors, a self-hosted SearXNG, or keyless
+public endpoints that receive every URL); none fits a local-only setup. `page_fetch` reads
+one page on this machine with a cookie jar, returns text, links or parsed listings within
+6000 characters (12000 at most), and needs no approval. Measured motivation (W0, 10-27): a
+"how many RTX 3060 ads?" question took 19.5 minutes with curl + `python3 -c` in the
+terminal, 19 approvals, a 100 000-character `read_file` and a full 64K context.
+
+**D-41 Outbound fetches only to public addresses.** `page_fetch` and the watchers refuse
+non-http(s) URLs, credentials in URLs, `localhost`/`.local`/`.internal`/`.ts.net` names and
+any name with a non-global answer (loopback, private, link-local, CGNAT = the tailnet,
+multicast, reserved), on every redirect too - the backend and llama-server listen on
+127.0.0.1. Known gap: DNS rebinding between the check and the connect; the agent has a
+shell anyway, the check keeps the approval-free tool from being the easy path.
+At most one request per host every 1.2 s across processes; hardverapro.hu paging
+(`offset=`) is refused (its robots.txt). hardverapro.hu serves searches only within a
+session: a browser-like `Accept` header, a cookie jar per watcher (kept between runs), and
+up to two retries 3 and 5 s apart while a new session warms up (measured, W1 diag2).
+
+**D-42 Context compression on, `read_file` capped at 16 000 characters.** The live config
+had `compression.enabled: false` (not a recorded decision). With a 64K window Hermes
+compresses at 75% (~49K), on the same llama slot, inside the run - slower than a short
+run, but a long run no longer dies at the window. `file_read_max_chars` (default 100 000,
+about 30K tokens) is lowered so a single read cannot take half the window.
+
 ## Rejected or deferred
 
 | Option | Outcome | Reason |
@@ -164,3 +211,5 @@ outside the repository, scanned as one set, sanitized, and only then installed.
 | Importing Hermes into the backend / custom gateway adapter | rejected | the API server is a stable, versioned contract |
 | Hermes approval-transport plugin | deferred | legacy approval API is verified; revisit if it is removed |
 | Backend running as `agent` | rejected | would see the agent's secrets |
+| Hermes web toolset (`web_search`/`web_extract`) | deferred | needs an outside provider; `page_fetch` covers reading (D-40); search maybe later via `ddgs` with `web.keyless_fallback: false` |
+| Hermes agent-mode cron / `monitor` for watchers | rejected | model calls outside the backend queue on the single slot (D-38) |

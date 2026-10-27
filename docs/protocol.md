@@ -148,7 +148,7 @@ the run ends with `run.completed`. Detect it as: `approval.request`, then
 Fixture: `tests/fixtures/toolsets/toolsets.json`.
 
 `{"object": "list", "platform": "api_server", "data": [{name, label, description, enabled, configured, tools[]}]}`.
-Enabled here: `terminal`, `file`, `vision`, `skills`, `agentcards` (11 tools).
+Enabled here: `terminal`, `file`, `vision`, `skills`, `agentcards` (13 tools: `agentcards` has `publish_water_card`, `page_fetch`, `watch_manage`).
 
 ## Behaviours a client must design around
 

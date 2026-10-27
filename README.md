@@ -44,11 +44,15 @@ fixtures that pin the behaviour down.
                                 ├─ Runs API (SSE events, approvals, stop)  ·  Sessions API
                                 ├─ SOUL.md "Operating rules" (loaded on every run)
                                 ├─ plugin agentcards → publish_water_card → cards/events.jsonl
+                                │                    page_fetch (one public page, bounded)
+                                │                    watch_manage → watches/<slug>.json + cron job
                                 └─ cron scheduler
                                      ├─ balaton-water (no-agent, 3×/day) → scripts/water_level.py
                                      │    └─ public lake gauge table → validate → cards/events.jsonl
-                                     └─ arch-updates (no-agent, daily 07:15) → scripts/updates_check.py
-                                          └─ checkupdates → validate → cards/events.jsonl
+                                     ├─ arch-updates (no-agent, daily 07:15) → scripts/updates_check.py
+                                     │    └─ checkupdates → validate → cards/events.jsonl
+                                     └─ watch:<slug> (no-agent, ≥30 min) → scripts/watch_<slug>.py
+                                          └─ watchlib: page → items → filters → new? → cards/events.jsonl
                                                           ⇅ HTTP, 127.0.0.1
                               llama-server  (user: <operator>, 127.0.0.1:8080)
                                    Qwen3.8-27B UD-IQ4_XS · 64K context · 1 slot · RTX 4070 SUPER + RTX 3050
@@ -58,7 +62,7 @@ fixtures that pin the behaviour down.
 |---|---|---|---|
 | `llama-server` | operator user | `127.0.0.1:8080` | systemd **user** unit, linger |
 | Hermes gateway + API server | dedicated `agent` user | `127.0.0.1:8642` | systemd user unit + drop-in, linger |
-| `balaton-water`, `arch-updates` jobs | `agent` (inside the gateway's scheduler) | – | Hermes cron, `--no-agent` |
+| `balaton-water`, `arch-updates`, `watch:*` jobs | `agent` (inside the gateway's scheduler) | – | Hermes cron, `--no-agent` |
 | `delve-backend` | system user `delve` | `127.0.0.1:8700`; tailnet via `tailscale serve` | system unit (`systemd/delve-backend.service`) |
 | phone client | – | – | planned |
 
@@ -88,7 +92,11 @@ wrong thing and puts the boundary where it cannot be talked around:
    `rm -r` to `rm -rf` on its own); no retry in another form after a block; say so
    explicitly if a requested value or command was changed.
 5. **Plugin tools have no path parameters.** `publish_water_card` writes to a fixed
-   JSONL file (`O_APPEND|O_NOFOLLOW`, `flock`, `0600`) after strict schema validation.
+   JSONL file (`O_APPEND|O_NOFOLLOW`, `flock`, `0644`) after strict schema validation.
+   `page_fetch` and the watchers take a URL but reach only public http(s) addresses
+   (no loopback, private, link-local or tailnet answers, checked on every redirect;
+   `docs/decisions.md` D-41); `watch_manage` writes only its own files under
+   `~/.hermes/watches/` and `scripts/watch_<slug>.py`, from a fixed template.
 6. **Secrets never enter command lines** (the agent can read the journal, including
    sudo's full command lines), and never enter this repository: see
    [Repository hygiene](#repository-hygiene).
@@ -113,7 +121,8 @@ hermes/
   config.fragments.yaml     curated, secret-free excerpt of the agent's config.yaml
   cron/balaton-water.sh     idempotent creation of the water-level cron job
   cron/arch-updates.sh      idempotent creation of the package-update cron job
-  plugins/agentcards/       Hermes plugin: card schema, validator, JSONL store, tool
+  plugins/agentcards/       Hermes plugin: card schema, validator, JSONL store, tools
+                            (publish_water_card, page_fetch, watch_manage), watchlib.py
   scripts/water_level.py    no-agent cron script: lake gauge → `water` card (stdlib only)
   scripts/updates_check.py  no-agent cron script: checkupdates → `updates` card (stdlib only)
 ops/
@@ -130,6 +139,7 @@ systemd/
   reference/                the generated unit, for reference only (not edited)
 tests/
   test_*.py                 offline, stdlib-only tests (run in CI)
+  fixtures/watch/           synthetic hardverapro / cinemacity pages + their generator
   deny-matrix.py, lib.sh, toolcall_test.py, longctx_test.py   on-host tests
   fixtures/                 recorded API protocol, runs, cards, toolsets, system samples (sanitized);
                             synthetic gauge table + its generator
@@ -228,18 +238,28 @@ This is a record of a working setup, not a turnkey installer. Paths use
     The backend writes `<id>/<name>` (0750/0640 through its `UMask=0027`; inside its user
     namespace the group shows as 65534, on the host it is `agent`) and names the path in the
     run's instructions; the agent reads it with `read_file`, without approval.
-18. **Reboot without logging in**, connect over SSH, run `ops/post-boot-check.sh`.
+18. **Watchers and page reading (Delve W):** copy `hermes/plugins/agentcards/` to
+    `~agent/.hermes/plugins/agentcards/` again, apply the `compression` and
+    `file_read_max_chars` keys of `hermes/config.fragments.yaml`, `hermes/SOUL.md` →
+    `~agent/.hermes/SOUL.md`, restart the gateway; `/v1/toolsets` lists `agentcards` with
+    `page_fetch` and `watch_manage`. A watcher is created from chat (`watch_manage`), which
+    writes `~/.hermes/watches/<slug>.json`, `~/.hermes/scripts/watch_<slug>.py` and the cron
+    job `watch:<slug>` (no-agent, `deliver: local`); its log is `~/.hermes/logs/watch.log`.
+    The helper's `agent.cron.list|pause|resume|run` verbs (step 16) let the backend show and
+    control them: reinstall `bin/delve-helper` and check `sudo delve helper agent.cron.list`.
+19. **Reboot without logging in**, connect over SSH, run `ops/post-boot-check.sh`.
 
 ## Tests
 
 | Test | Where | What it proves |
 |---|---|---|
 | `tests/test_agentcards.py` | CI + host | plugin tool: validation, event building, JSONL store (temp dir) |
-| `tests/test_delve_helper.py` | CI + host | privileged helper: request parsing, verb whitelist, exact commands, `systemctl show` / `nvidia-smi` / `hermes cron incidents` / `/proc` parsing on the samples in `tests/fixtures/system/` |
+| `tests/test_delve_helper.py` | CI + host | privileged helper: request parsing, verb whitelist, job-id argument rules, exact commands, `systemctl show` / `nvidia-smi` / `hermes cron incidents` / `jobs.json` / `/proc` parsing on the samples in `tests/fixtures/system/` |
 | `tests/test_updates_check.py` | CI + host | `checkupdates` parser on a real 44-package output, `updates` payload validator |
 | `tests/test_water_schema.py` | CI + host | `water` payload validator: ranges, types, time window, unknown fields |
 | `tests/test_water_level.py` | CI + host | gauge table parser against the synthetic fixture + 13 malformed variants |
-| fixture reproducibility | CI | `make_tohid_synthetic.py` regenerates a byte-identical fixture |
+| `tests/test_watch.py` | CI + host | watchers: public-address guard (incl. redirects), hardverapro / cinemacity / generic parsers on synthetic pages, filters, config rules, the run cycle (baseline, new items, cap, errors, `watch_*` cards), `page_fetch`, `watch_manage` against a fake Hermes cron |
+| fixture reproducibility | CI | `make_tohid_synthetic.py` and `make_watch_synthetic.py` regenerate byte-identical fixtures |
 | script dry-run | CI | `water_level.py --dry-run` and `updates_check.py --dry-run` produce valid v1 `water` / `updates` events |
 | gitleaks (push range; full history weekly and on demand) | CI | no secrets in any commit |
 | `ops/deny-check.sh` → `tests/deny-matrix.py` | host | 19 commands × expected outcome through Hermes' own matcher (`pass` / `appr` / `deny` / `hard`) |
@@ -250,7 +270,7 @@ This is a record of a working setup, not a turnkey installer. Paths use
 The offline tests use only the standard library and run from any directory:
 
 ```sh
-for t in test_water_level test_water_schema test_agentcards test_delve_helper test_updates_check; do python3 -I tests/$t.py; done
+for t in test_water_level test_water_schema test_agentcards test_delve_helper test_updates_check test_watch; do python3 -I tests/$t.py; done
 ```
 
 The on-host tests need the live Hermes install (its Python and modules) or the running
@@ -275,7 +295,9 @@ Run after any Hermes, `llama.cpp`, kernel or NVIDIA/CUDA update:
 
 1. `ops/deny-check.sh` → 19/19.
 2. `/health` reports the expected Hermes version; capabilities unchanged.
-3. `hermes plugins doctor agentcards`; `/v1/toolsets` lists `agentcards` enabled.
+3. `hermes plugins doctor agentcards`; `/v1/toolsets` lists `agentcards` enabled with
+   `publish_water_card`, `page_fetch`, `watch_manage`; `watch_manage action=list` answers
+   (it calls Hermes' `tools.cronjob_tools.cronjob` in-process - an internal entry point).
 4. `tools.tool_search.enabled` is still `"off"`; a card run takes one tool round.
 5. Protocol cases via `tests/lib.sh`, compared with `tests/fixtures/protocol/`.
 6. `toolcall_test.py`, `longctx_test.py` against the model server.
@@ -311,6 +333,9 @@ desktop; RTX 3050 8 GB on a chipset x4 slot), 64K context, q8_0 KV cache, one sl
   security boundary.
 - **Pinned versions.** Hermes and `llama.cpp` are updated deliberately, followed by the
   regression checklist.
+- **Watchers scrape pages.** A layout change of a watched site makes its watcher fail
+  with exit code 2 (an error `watch_run` card and a cron incident), never with made-up
+  items; `hardverapro` only reads the first result page (robots.txt forbids paging).
 - **The data source is a scraped HTML table.** A format change makes the script fail
   with exit code 2, which opens a Hermes cron incident instead of publishing bad data.
 
