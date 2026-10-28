@@ -326,6 +326,40 @@ class RunCycle(unittest.TestCase):
         self.assertEqual(out["new"], 0)
         self.assertEqual(self.types(), ["watch_run"])          # the def is not repeated
 
+    def test_reserved_item_reported_when_available_again(self):
+        self.save()
+        free = fixture("ha-search-synthetic.html")
+        booked = free.replace("175 000 Ft</span>", "175 000 Ft</span> <span>jegelve</span>")
+        self.assertNotEqual(free, booked)
+        self.run_(FakeFetcher(ha_pages(booked)))           # baseline, the 175k ad is booked
+        st = watchlib.load_state("rtx", self.base)
+        self.assertEqual(list(st["reserved"]), ["ha:9100002"])
+        self.cards.clear()
+        self.run_(FakeFetcher(ha_pages(booked)))           # still booked: nothing
+        self.assertEqual(self.types(), ["watch_run"])
+        self.cards.clear()
+        self.run_(FakeFetcher(ha_pages(free)))             # free again
+        self.assertEqual(self.types(), ["watch_candidate", "watch_run"])
+        cand = self.cards[0]["payload"]
+        self.assertEqual((cand["item_id"], cand["change"]), ("ha:9100002", "available"))
+        self.assertNotIn("reserved", cand)
+        self.assertEqual(watchlib.load_state("rtx", self.base)["reserved"], {})
+        self.cards.clear()
+        self.run_(FakeFetcher(ha_pages(free)))             # reported once
+        self.assertEqual(self.types(), ["watch_run"])
+
+    def test_new_reserved_item_is_marked(self):
+        self.save()
+        self.run_(FakeFetcher(ha_pages()))
+        page = fixture("ha-search-synthetic.html").replace(
+            'data-uadid="9100006"', 'data-uadid="9100007"').replace(
+            "Zotac Gaming GeForce RTX 3060 Twin Edge 12GB", "Zotac RTX 4070 Super Twin Edge").replace(
+            "84 000 Ft</span>", "84 000 Ft jegelve</span>")
+        self.cards.clear()
+        self.run_(FakeFetcher(ha_pages(page)))
+        cands = [c["payload"] for c in self.cards if c["type"] == "watch_candidate"]
+        self.assertEqual([(c["item_id"], c.get("reserved")) for c in cands], [("ha:9100007", True)])
+
     def test_details_and_cap(self):
         self.save(include=["rtx"], max_price=None, exclude=[], fetch_details=True,
                   notify_existing=True)
@@ -354,6 +388,14 @@ class RunCycle(unittest.TestCase):
         self.assertEqual((run["payload"]["status"], run["severity"]), ("error", "warn"))
         self.assertEqual(run["payload"]["error_code"], "search_ignored")
         self.assertEqual(watchlib.load_state("rtx", self.base)["errors"], 1)
+
+    def test_http_error_card(self):
+        # the error code carries the status (http_404): the card must still be valid
+        self.save()
+        with self.assertRaises(watchlib.FetchError):
+            self.run_(FakeFetcher({}))
+        (run,) = [c for c in self.cards if c["type"] == "watch_run"]
+        self.assertEqual(run["payload"]["error_code"], "http_404")
 
     def test_stop_after_hit_announces_existing(self):
         watchlib.save_config(watchlib.validate_config({
@@ -535,8 +577,11 @@ class Schemas(unittest.TestCase):
         ok_ts = (now - dt.timedelta(minutes=1)).isoformat()
         good = {"slug": "rtx", "item_id": "ha:1", "title": "t", "url": "https://x.example/a"}
         schemas.validate_watch_candidate(good, now)
+        self.assertEqual(schemas.validate_watch_candidate(
+            {**good, "reserved": True, "change": "available"}, now)["change"], "available")
         for bad in ({**good, "url": "javascript:x"}, {**good, "item_id": "a b"},
-                    {**good, "excerpt": "x" * 1501}, {**good, "extra": 1}):
+                    {**good, "excerpt": "x" * 1501}, {**good, "extra": 1},
+                    {**good, "change": "sold"}, {**good, "reserved": "yes"}):
             with self.subTest(bad=bad):
                 with self.assertRaises(schemas.CardValidationError):
                     schemas.validate_watch_candidate(bad, now)

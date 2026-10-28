@@ -275,7 +275,7 @@ def validate_watch_run(p, now):
         "new": _int(p.get("new"), "new", 0, 100000, errs, status == "ok"),
         "candidates": _int(p.get("candidates"), "candidates", 0, 1000, errs, status == "ok"),
         "baseline": _bool(p.get("baseline"), "baseline", errs, False, False),
-        "error_code": _match(p.get("error_code"), "error_code", re.compile(r"[a-z_]{1,40}"),
+        "error_code": _match(p.get("error_code"), "error_code", re.compile(r"[a-z0-9_]{1,40}"),
                              40, errs, status == "error"),
         "error": _str(p.get("error"), "error", 300, errs, False),
         "duration_ms": _int(p.get("duration_ms"), "duration_ms", 0, 3_600_000, errs, False),
@@ -287,7 +287,9 @@ def validate_watch_run(p, now):
 
 
 WATCH_CANDIDATE_FIELDS = ("slug", "item_id", "title", "url", "price", "price_value",
-                          "location", "posted", "excerpt")
+                          "location", "posted", "excerpt", "reserved", "change")
+# change: an item announced earlier came back in a new state ("available": no longer reserved)
+WATCH_CHANGES = ("available",)
 
 
 def validate_watch_candidate(p, now):
@@ -305,7 +307,11 @@ def validate_watch_candidate(p, now):
         "location": _str(p.get("location"), "location", 120, errs, False),
         "posted": _str(p.get("posted"), "posted", 60, errs, False),
         "excerpt": _str(p.get("excerpt"), "excerpt", 1500, errs, False),
+        "reserved": _bool(p.get("reserved"), "reserved", errs, False),
+        "change": _str(p.get("change"), "change", 20, errs, False),
     }
+    if out["change"] is not None and out["change"] not in WATCH_CHANGES:
+        errs.append(f"change: must be one of {', '.join(WATCH_CHANGES)}")
     if errs:
         raise CardValidationError(errs)
     return {k: v for k, v in out.items() if v is not None}

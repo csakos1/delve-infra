@@ -199,6 +199,15 @@ compresses at 75% (~49K), on the same llama slot, inside the run - slower than a
 run, but a long run no longer dies at the window. `file_read_max_chars` (default 100 000,
 about 30K tokens) is lowered so a single read cannot take half the window.
 
+**D-43 Reserved listings are followed until they are free (W2).** hardverapro.hu marks a
+booked ad "jegelve" next to its price. The watcher keeps matching items that carry the mark
+in its state (`reserved`, forgotten after 30 days unseen); a new candidate carries
+`reserved: true`, and an item announced earlier whose mark is gone comes again as a
+`watch_candidate` with `change: "available"`. The backend pushes that only for an earlier
+hit (the user's choice: mark the hit, then say when it is available). `watch_run`
+`error_code` may contain digits (`http_404`): the old pattern rejected it, and the error
+card of an HTTP failure was silently dropped.
+
 ## Rejected or deferred
 
 | Option | Outcome | Reason |

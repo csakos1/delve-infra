@@ -216,8 +216,12 @@ WATCH_MANAGE_SCHEMA = {
             "exclude": {"type": "array", "items": {"type": "string"}},
             "min_price": {"type": "integer", "description": "HUF"},
             "max_price": {"type": "integer", "description": "HUF"},
-            "criteria": {"type": "string", "description": "free-text condition in the user's "
-                         "words, judged per new item (max 500 chars)"},
+            "criteria": {"type": "string", "description": "what the ad must say about the "
+                         "item, as a plain statement of meaning in the user's language, e.g. "
+                         "'Nem volt bányászásra használva.' - not a list of words to look for "
+                         "(words go to include/exclude). A model reads each new ad against it "
+                         "(max 500 chars). Leave it out when the filters already decide, and "
+                         "always for cinemacity"},
             "fetch_details": {"type": "boolean", "description": "read each new ad's own page "
                               "for the criteria (hardverapro)"},
             "stop_after_hit": {"type": "boolean", "description": "pause after the first hit"},

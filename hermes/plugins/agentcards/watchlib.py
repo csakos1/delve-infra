@@ -66,6 +66,8 @@ MAX_REDIRECTS = 8
 MAX_CANDIDATES = 10            # per run; the rest is marked seen and counted
 MAX_DETAILS = 10               # detail pages fetched per run (only with fetch_details)
 MAX_SEEN = 5000
+MAX_CHANGES = 10               # "available again" cards per run
+RESERVED_KEEP_DAYS = 30        # a reserved item not seen for this long is forgotten
 MAX_WATCHES = 20
 EXCERPT_CHARS = 1500
 
@@ -451,6 +453,11 @@ def item_matches(item: dict[str, Any], cfg: dict[str, Any]) -> bool:
     return True
 
 
+def is_reserved(text: str | None) -> bool:
+    """Hardverapró marks a booked ad with "jegelve" next to the price."""
+    return bool(text) and "jegelve" in fold(text)  # type: ignore[arg-type]
+
+
 def short_id(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
@@ -527,6 +534,7 @@ class HardverApro(Source):
                 "price": price or None,
                 "price_value": price_value(price),
                 "wanted": bool(price) and fold(price).startswith(("keres", "csere")),
+                "reserved": is_reserved(li.text().replace(a.text(), " ")),
                 "location": city.text() if city else None,
                 "posted": when.text() if when else None,
             })
@@ -830,8 +838,29 @@ def _candidate_payload(slug: str, item: dict[str, Any], excerpt: str | None) -> 
     p = {"slug": slug, "item_id": item["item_id"], "title": _clip(item.get("title"), 300) or "?",
          "url": item["url"], "price": _clip(item.get("price"), 60),
          "price_value": item.get("price_value"), "location": _clip(item.get("location"), 120),
-         "posted": _clip(item.get("posted"), 60), "excerpt": excerpt}
+         "posted": _clip(item.get("posted"), 60), "excerpt": excerpt,
+         "reserved": True if item.get("reserved") else None}
     return {k: v for k, v in p.items() if v is not None}
+
+
+def reserved_changes(st: dict[str, Any], matched: list[dict[str, Any]], seen: dict[str, str],
+                     stamp: str, now: dt.datetime) -> list[dict[str, Any]]:
+    """Track reserved items in the state; return the seen ones that are no longer reserved.
+    Updates ``st["reserved"]`` (item id -> last time seen reserved)."""
+    reserved: dict[str, str] = st.setdefault("reserved", {})
+    back: list[dict[str, Any]] = []
+    for item in matched:
+        iid = item["item_id"]
+        if item.get("reserved"):
+            reserved[iid] = stamp
+        elif iid in reserved:
+            del reserved[iid]
+            if iid in seen:
+                back.append(item)
+    cutoff = _iso(now - dt.timedelta(days=RESERVED_KEEP_DAYS))
+    for iid in [k for k, v in reserved.items() if v < cutoff]:
+        del reserved[iid]
+    return back[:MAX_CHANGES]
 
 
 Publisher = Callable[[dict[str, Any]], Any]
@@ -918,8 +947,11 @@ def run_watch(slug: str, *, dry_run: bool = False, fetcher: Fetcher | None = Non
             {k: i.get(k) for k in ("item_id", "title", "price", "location", "posted", "url")
              if i.get(k)} for i in (new or matched)[:10]]}
 
+    back = reserved_changes(st, matched, seen, stamp, now)
     for item in announce:
         emit("watch_candidate", _candidate_payload(slug, item, excerpts.get(item["item_id"])))
+    for item in back:
+        emit("watch_candidate", {**_candidate_payload(slug, item, None), "change": "available"})
     emit("watch_run", summary)
     for item in new:
         seen[item["item_id"]] = stamp
