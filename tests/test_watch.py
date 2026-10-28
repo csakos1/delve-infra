@@ -22,6 +22,8 @@ import schemas  # noqa: E402
 import watch_tools  # noqa: E402
 import watchlib  # noqa: E402
 
+watchlib.SLEEP = lambda _s: None   # no real waits in the session warm-up retries
+
 HA_SEARCH = "https://hardverapro.hu/aprok/keres.php?stext=rtx"
 HA_ITEM_PREFIX = "https://hardverapro.hu/apro/"
 CC_FILM = "https://www.cinemacity.hu/films/kitalalt-film-ketto/1002s2r"
@@ -144,7 +146,7 @@ class Parsers(unittest.TestCase):
                 return page
         idx = "https://hardverapro.hu/aprok/index.html"
         waits: list[float] = []
-        orig, watchlib.SLEEP = watchlib.SLEEP, waits.append
+        orig, watchlib.SLEEP = watchlib.SLEEP, waits.append   # noqa: F841 (restored below)
         try:
             f = Seq([idx, idx, HA_SEARCH])              # sign-on round, warm-up, real search
             items, _ = watchlib.HardverApro().items(f, HA_SEARCH)
@@ -177,7 +179,27 @@ class Parsers(unittest.TestCase):
         with self.assertRaises(watchlib.ParseError):
             src.parse_films({"films": []})
         with self.assertRaises(watchlib.ConfigError):
-            src.validate_url("https://www.cinemacity.hu/films/")
+            src.validate_url("https://example.org/films/x/1001s2r")
+        # without a film id: all bookable films, picked by title words
+        items, _ = src.items(FakeFetcher(cc_pages(True)), "https://www.cinemacity.hu/")
+        self.assertEqual(len(items), 2)
+        hits = [i for i in items if watchlib.item_matches(i, {"include": ["ketto"]})]
+        self.assertEqual([i["item_id"] for i in hits], ["cc:1002s2r"])
+
+    def test_cinemacity_rules_and_invented_film_page(self):
+        with self.assertRaisesRegex(watchlib.ConfigError, "include words"):   # no id, no words
+            watchlib.validate_config({"slug": "film", "name": "f", "source": "cinemacity",
+                                      "url": "https://www.cinemacity.hu/", "schedule": "every 4h"})
+        c = watchlib.validate_config({"slug": "film", "name": "f", "url": "https://www.cinemacity.hu/",
+                                      "source": "cinemacity", "include": ["doom"], "schedule": "every 4h"})
+        self.assertTrue(c["notify_existing"])               # a film already bookable is news
+        made_up = "https://www.cinemacity.hu/films/bosszuallokok-dr-doom-erbedese/9001d2r"
+        pages = {**cc_pages(True)}
+        with self.assertRaises(watchlib.ConfigError):       # 404 -> refused before anything is saved
+            watchlib.preview({**c, "url": made_up}, FakeFetcher(pages))
+        pages[CC_FILM] = ("", "text/html", "<html><head><title>Kitalált Film Kettő | Jegyvásárlás a Cinema City mozikban</title></head></html>")
+        out = watchlib.preview({**c, "url": CC_FILM, "include": []}, FakeFetcher(pages))
+        self.assertEqual(out["matched"], 1)
 
     def test_generic_links(self):
         html = ('<html><body><a href="/a">RTX 3060 eladó</a><a href="#top">RTX top</a>'
@@ -188,6 +210,15 @@ class Parsers(unittest.TestCase):
 
 
 class Filters(unittest.TestCase):
+    def test_word_start(self):
+        t = watchlib.fold("ASUS ROG Original RTX4070Super, nem bányászott")
+        self.assertFalse(watchlib.has_word(t, "rig"))       # not inside 'original'
+        self.assertTrue(watchlib.has_word(t, "orig"))
+        self.assertTrue(watchlib.has_word(t, "4070"))       # letter -> digit change
+        self.assertTrue(watchlib.has_word(t, "super"))      # digit -> letter change
+        self.assertTrue(watchlib.has_word(t, "bányász"))    # prefix of a word, accents folded
+        self.assertFalse(watchlib.has_word(t, "ászott"))
+
     def test_fold_and_price(self):
         self.assertEqual(watchlib.fold("Bányászott ŐSZI"), "banyaszott oszi")
         self.assertEqual(watchlib.price_value("299 990 Ft"), 299990)
@@ -465,6 +496,7 @@ class Manage(unittest.TestCase):
 
         out = self.call(action="list")
         self.assertEqual(len(out["watchers"]), 2)
+        self.assertRegex(out["watchers"][0]["last_ok_at"], r"^\d{4}-\d\d-\d\d \d\d:\d\d$")   # local, no Z
         self.assertEqual(out["watchers"][0]["job"]["state"], "scheduled")
 
         out = self.call(action="update", slug=slug, schedule="15 8,13,19 * * *", max_price=150000)

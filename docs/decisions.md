@@ -168,8 +168,10 @@ the cron job in-process through Hermes' `tools.cronjob_tools.cronjob` (the entry
 the `hermes cron` CLI) and runs the baseline. The `cronjob` toolset stays off (D-08): the
 model cannot create agent-mode jobs. Sources are code with tests: `hardverapro` (listing
 and search pages, ad pages for `fetch_details`), `cinemacity` (the bookable-film list of
-the site's JSON API), `page` (links of any page). At most 20 watchers, at most every 30
-minutes, at most hourly for cron expressions; first run = baseline (already listed items
+the site's JSON API, matched by film id or by title words; a film page URL is checked to
+exist, because the model once invented one), `page` (links of any page). At most 20 watchers, at most every 30
+minutes, at most hourly for cron expressions; title words match at word starts ('rig' is not
+in 'original'); first run = baseline (already listed items
 are not announced), except for `stop_after_hit` watchers.
 
 **D-40 `page_fetch` instead of the Hermes web toolset.** Hermes' `web_search` /

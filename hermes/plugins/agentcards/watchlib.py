@@ -414,14 +414,32 @@ def price_value(text: str | None) -> int | None:
     return int(digits) if digits and len(digits) <= 10 else None
 
 
+def has_word(title: str, word: str) -> bool:
+    """`word` (folded) starts a word in `title` (folded): 'rig' is not in 'original', but
+    'banyasz' is in 'banyaszott' and '4070' in 'rtx4070' (a letter/digit change counts as
+    a word start)."""
+    w = fold(word).strip()
+    if not w:
+        return False
+    i = title.find(w)
+    while i != -1:
+        if i == 0:
+            return True
+        prev = title[i - 1]
+        if not prev.isalnum() or prev.isalpha() != w[0].isalpha():
+            return True
+        i = title.find(w, i + 1)
+    return False
+
+
 def item_matches(item: dict[str, Any], cfg: dict[str, Any]) -> bool:
     title = fold(item.get("title") or "")
-    if any(fold(w) not in title for w in cfg.get("include") or []):
+    if any(not has_word(title, w) for w in cfg.get("include") or []):
         return False
     anyw = cfg.get("any") or []
-    if anyw and not any(fold(w) in title for w in anyw):
+    if anyw and not any(has_word(title, w) for w in anyw):
         return False
-    if any(fold(w) in title for w in cfg.get("exclude") or []):
+    if any(has_word(title, w) for w in cfg.get("exclude") or []):
         return False
     lo, hi = cfg.get("min_price"), cfg.get("max_price")
     if lo is not None or hi is not None:
@@ -460,6 +478,9 @@ class Source:
 
     def details(self, fetcher: Fetcher, item: dict[str, Any]) -> str | None:
         return None
+
+    def verify(self, fetcher: Fetcher, cfg: dict[str, Any]) -> None:
+        """Extra checks before a watcher is created (preview); raises ConfigError."""
 
 
 class HardverApro(Source):
@@ -564,18 +585,43 @@ class HardverApro(Source):
 
 
 class CinemaCity(Source):
-    """Cinema City Hungary: the film appears in the bookable film list of the site's API."""
+    """Cinema City Hungary: a film appears in the bookable film list of the site's API.
+
+    Items are the bookable films. With a film page URL (…/films/<name>/<id>) only that film
+    counts; with any other cinemacity.hu URL the include/any words pick films by title, so
+    no film id has to be known (or guessed) in advance."""
     name = "cinemacity"
-    description = ("cinemacity.hu film page https://www.cinemacity.hu/films/<name>/<id>; "
-                   "a hit = the film can be booked (it is in the site's bookable film list)")
+    description = ("cinemacity.hu: url = https://www.cinemacity.hu/ plus include = words of the "
+                   "film title (or the real film page https://www.cinemacity.hu/films/<name>/<id>); "
+                   "a hit = the film can be booked")
     API = "https://www.cinemacity.hu/hu/data-api-service/v1/quickbook/10102/films/until/{until}"
     URL_RE = re.compile(r"https://www\.cinemacity\.hu/films/[a-z0-9-]+/([0-9a-z]{4,12})/?")
 
     def validate_url(self, url):
-        if not self.URL_RE.fullmatch(url.strip()):
-            raise ConfigError("cinemacity: use the film page URL "
-                              "https://www.cinemacity.hu/films/<name>/<id>")
-        return url.strip()
+        url = url.strip()
+        p = urllib.parse.urlsplit(url)
+        if p.scheme != "https" or p.hostname != "www.cinemacity.hu":
+            raise ConfigError("cinemacity: use https://www.cinemacity.hu/ (with include words of "
+                              "the title) or the film page https://www.cinemacity.hu/films/<name>/<id>")
+        return url
+
+    def film_id(self, url: str) -> str | None:
+        m = self.URL_RE.fullmatch(url.strip())
+        return m.group(1).lower() if m else None
+
+    def verify(self, fetcher, cfg):
+        """A film page URL must exist: a made-up id would never match."""
+        if self.film_id(cfg["url"]) is None:
+            return
+        try:
+            page = fetcher.get(cfg["url"])
+        except FetchError as exc:
+            raise ConfigError(f"cinemacity: the film page does not exist ({exc.code}); use "
+                              "url https://www.cinemacity.hu/ with include words of the title") from None
+        title = page_title(parse_html(page.text))
+        if "Cinema City" not in title or title.lower().startswith(("legújabb filmek", "404")):
+            raise ConfigError("cinemacity: that URL is not a film page; use url "
+                              "https://www.cinemacity.hu/ with include words of the title")
 
     @staticmethod
     def parse_films(data: Any) -> list[dict[str, Any]]:
@@ -594,7 +640,7 @@ class CinemaCity(Source):
         return out
 
     def items(self, fetcher, url):
-        film_id = self.URL_RE.fullmatch(url.strip()).group(1).lower()  # type: ignore[union-attr]
+        film_id = self.film_id(url)
         until = (dt.date.today() + dt.timedelta(days=400)).isoformat()
         page = fetcher.get(self.API.format(until=until), accept="application/json")
         films = self.parse_films(page.json())
@@ -602,8 +648,8 @@ class CinemaCity(Source):
             raise ParseError("empty film list (the API changed?)")
         out = []
         for f in films:
-            if f["film_id"] == film_id:
-                out.append({"item_id": f"cc:{film_id}", "title": f"{f['title']} – jegyek kaphatók",
+            if film_id is None or f["film_id"] == film_id:
+                out.append({"item_id": f"cc:{f['film_id']}", "title": f"{f['title']} – jegyek kaphatók",
                             "url": f["url"] if f["url"].startswith("https://") else url,
                             "posted": f["release"][:10] or None})
         return out, page
@@ -629,7 +675,7 @@ def source_for_url(url: str) -> str:
     host = (urllib.parse.urlsplit(url).hostname or "").lower()
     if host in HardverApro.HOSTS:
         return "hardverapro"
-    if host == "www.cinemacity.hu" and CinemaCity.URL_RE.fullmatch(url):
+    if host == "www.cinemacity.hu":
         return "cinemacity"
     return "page"
 
@@ -681,13 +727,17 @@ def validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
     clean["url"] = src.validate_url(clean["url"])
     if clean["source"] == "page" and not (clean["include"] or clean["any"]):
         raise ConfigError("page: give at least one include or any word")
+    if clean["source"] == "cinemacity" and CinemaCity().film_id(clean["url"]) is None \
+            and not (clean["include"] or clean["any"]):
+        raise ConfigError("cinemacity: give include words of the film title (or the film page URL)")
     if clean["fetch_details"] and not src.has_details:
         clean["fetch_details"] = False
     lo, hi = clean.get("min_price"), clean.get("max_price")
     if lo is not None and hi is not None and lo > hi:
         raise ConfigError("min_price is above max_price")
     if "notify_existing" not in cfg or cfg.get("notify_existing") is None:
-        clean["notify_existing"] = bool(clean["stop_after_hit"])
+        # "tell me when tickets are on sale": a film already bookable is news too
+        clean["notify_existing"] = bool(clean["stop_after_hit"]) or clean["source"] == "cinemacity"
     for k in ("job_id", "created_at"):
         if isinstance(cfg.get(k), str):
             clean[k] = cfg[k][:64]
@@ -888,7 +938,9 @@ def run_watch(slug: str, *, dry_run: bool = False, fetcher: Fetcher | None = Non
 def preview(cfg: dict[str, Any], fetcher: Fetcher | None = None) -> dict[str, Any]:
     """Fetch + filter a (not yet saved) config: what the watcher would see now."""
     cfg = validate_config(cfg)
-    items, matched, page = collect(cfg, fetcher or Fetcher())
+    fetcher = fetcher or Fetcher()
+    SOURCES[cfg["source"]].verify(fetcher, cfg)
+    items, matched, page = collect(cfg, fetcher)
     return {"items": len(items), "matched": len(matched), "final_url": page.final_url,
             "sample": [{k: i.get(k) for k in ("title", "price", "location", "posted", "url")
                         if i.get(k)} for i in matched[:8]]}
@@ -912,8 +964,7 @@ def read_page(url: str, mode: str = "text", find: str | None = None, max_chars: 
 
     if mode == "listings" and src_name in ("hardverapro", "cinemacity"):
         src = SOURCES[src_name]
-        if src_name == "cinemacity":
-            src.validate_url(url)
+        src.validate_url(url)
         items, page = src.items(fetcher, url)
         total = None
         if src_name == "hardverapro":

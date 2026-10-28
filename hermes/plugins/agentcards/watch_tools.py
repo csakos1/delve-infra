@@ -136,12 +136,16 @@ PAGE_FETCH_SCHEMA = {
     "description": (
         "Read ONE public web page and get a compact view of it: mode 'text' (readable text "
         "lines), 'links' (link text + URL) or 'listings' (structured ads/items for known sites: "
-        "hardverapro.hu listing/search pages, cinemacity.hu film pages; other sites fall back "
+        "hardverapro.hu listing/search pages, cinemacity.hu bookable films; other sites fall back "
         "to links). 'find' keeps only lines/links/items containing ALL of its words (case and "
         "accent insensitive). Output is capped (max_chars, default 6000). Use this instead of "
         "curl/wget/python in the terminal for any web page. Only public http(s) addresses work. "
         "For hardverapro.hu searches use https://hardverapro.hu/aprok/keres.php?stext=<words> "
-        "(plus filters like maxprice=…); only the first result page may be read."),
+        "(plus filters like maxprice=…); search inside a category to leave out whole PCs, e.g. "
+        "https://hardverapro.hu/aprok/hardver/videokartya/keres.php?stext=<words> for graphics "
+        "cards; only the first result page may be read (site_total = the full count). For "
+        "cinemacity.hu, mode 'listings' on https://www.cinemacity.hu/ lists the bookable films. "
+        "Web search engines do not work here; do not guess URLs."),
     "parameters": {
         "type": "object",
         "properties": {
@@ -188,8 +192,9 @@ WATCH_MANAGE_SCHEMA = {
         "'delete', 'run' (check now). Workflow for a new request: preview -> show the user the "
         "count and a few matches -> create. Sources: 'hardverapro' (url = a hardverapro.hu "
         "/aprok/ category page or https://hardverapro.hu/aprok/keres.php?stext=<words>), "
-        "'cinemacity' (url = the film page https://www.cinemacity.hu/films/<name>/<id>; a hit "
-        "means tickets can be booked; use stop_after_hit), 'page' (any page; items = links "
+        "'cinemacity' (url = https://www.cinemacity.hu/ and include = one or two distinctive "
+        "words of the film's Hungarian title, e.g. ['doom']; a hit means tickets can be booked; "
+        "never guess a film page URL or id), 'page' (any page; items = links "
         "whose text has the words). 'include' = all of these words must be in the title, "
         "'any' = at least one, 'exclude' = none (case and accent insensitive). Put conditions "
         "that need reading the ad (condition, 'not mined', 'with warranty') into 'criteria' "
@@ -216,8 +221,9 @@ WATCH_MANAGE_SCHEMA = {
             "fetch_details": {"type": "boolean", "description": "read each new ad's own page "
                               "for the criteria (hardverapro)"},
             "stop_after_hit": {"type": "boolean", "description": "pause after the first hit"},
-            "schedule": {"type": "string", "description": "e.g. 'every 4h', '15 8,13,19 * * *' "
-                         "(at most every 30 min)"},
+            "schedule": {"type": "string", "description": "'N times a day' = a cron expression "
+                         "at daytime hours, e.g. three times a day '15 8,13,19 * * *'; or an "
+                         "interval 'every 4h' (at most every 30 min)"},
         },
         "required": ["action"],
         "additionalProperties": False,
@@ -299,8 +305,8 @@ class WatchManager:
         except watchlib.WatchError as exc:
             first = {"status": "error", "error": str(exc)[:200]}
         return _ok(action="create", slug=slug, job_id=cfg["job_id"], schedule=cfg["schedule"],
-                   next_run_at=res.get("next_run_at"), definition=_public(cfg),
-                   matching_now=now["matched"], sample=now["sample"][:5], first_run=first,
+                   next_run_at=_local(res.get("next_run_at")), definition=_public(cfg),
+                   matching_now=now["matched"], sample=now["sample"][:5], first_run=_localize(first),
                    note=("Items listed now are recorded as seen; only new ones will notify."
                          if not cfg.get("notify_existing") else
                          "Current matches are announced too (stop_after_hit/notify_existing)."))
@@ -314,7 +320,8 @@ class WatchManager:
                          "last_ok_at": st.get("last_ok_at"), "last_error": st.get("last_error"),
                          "seen": len(st.get("seen", {}))})
         orphans = [n for n in jobs if n[len(JOB_PREFIX):] not in {r["slug"] for r in rows}]
-        return _ok(action="list", watchers=rows, orphan_jobs=orphans)
+        return _ok(action="list", watchers=_localize(rows), orphan_jobs=orphans,
+                   note="times are local")
 
     def update(self, args):
         slug = self._slug(args)
@@ -363,7 +370,7 @@ class WatchManager:
         slug = self._slug(args)
         out = watchlib.run_watch(slug, fetcher=self._fetcher(slug), publish=self.publish,
                                  base=self.base)
-        return _ok(action="run", result=out)
+        return _ok(action="run", result=_localize(out))
 
     def _remove_files(self, slug: str) -> None:
         for p in (watchlib.config_path(slug, self.base), watchlib.state_path(slug, self.base),
@@ -390,6 +397,26 @@ class WatchManager:
         except Exception as exc:  # noqa: BLE001 - a tool must answer, not crash the turn
             logger.exception("watch_manage %s failed", action)
             return _fail("internal_error", message=f"{type(exc).__name__}: {exc}"[:300])
+
+
+def _local(ts: Any) -> Any:
+    """'2026-10-28T10:16:30Z' -> '2026-10-28 11:16' in the machine's time zone (the model
+    otherwise reports UTC clock times to the user)."""
+    if not isinstance(ts, str) or not ts:
+        return ts
+    try:
+        return dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return ts
+
+
+def _localize(d: Any) -> Any:
+    if isinstance(d, dict):
+        return {k: (_local(v) if k in ("checked_at", "last_ok_at", "next_run_at", "last_run_at",
+                                         "created_at") else _localize(v)) for k, v in d.items()}
+    if isinstance(d, list):
+        return [_localize(v) for v in d]
+    return d
 
 
 def _public(cfg: dict[str, Any]) -> dict[str, Any]:
