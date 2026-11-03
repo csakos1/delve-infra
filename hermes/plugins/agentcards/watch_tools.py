@@ -24,8 +24,9 @@ import sys
 from typing import Any, Callable
 
 try:  # inside the plugin package
-    from . import watchlib
+    from . import recipes, watchlib
 except ImportError:  # tests: the directory is on sys.path
+    import recipes  # type: ignore[no-redef]
     import watchlib  # type: ignore[no-redef]
 
 logger = logging.getLogger(__name__)
@@ -135,10 +136,14 @@ PAGE_FETCH_SCHEMA = {
     "name": "page_fetch",
     "description": (
         "Read ONE public web page and get a compact view of it: mode 'text' (readable text "
-        "lines), 'links' (link text + URL) or 'listings' (structured ads/items for known sites: "
+        "lines), 'links' (link text + URL), 'listings' (structured ads/items for known sites: "
         "hardverapro.hu listing/search pages, cinemacity.hu bookable films; other sites fall back "
-        "to links). 'find' keeps only lines/links/items containing ALL of its words (case and "
-        "accent insensitive). Output is capped (max_chars, default 6000). Use this instead of "
+        "to links) or 'structure' (before a watcher on any other site: numbered candidates of "
+        "what a watcher could read there - repeated items, JSON lists, a product's stock/price - "
+        "each with real sample items; pages built by JavaScript or refused to scripts are loaded "
+        "in a headless browser automatically, or force it with render=true). 'find' keeps only "
+        "lines/links/items containing ALL of its words (case and accent insensitive). Output is "
+        "capped (max_chars, default 6000). Use this instead of "
         "curl/wget/python in the terminal for any web page. Only public http(s) addresses work. "
         "For hardverapro.hu searches use https://hardverapro.hu/aprok/keres.php?stext=<words> "
         "(plus filters like maxprice=…); search inside a category to leave out whole PCs, e.g. "
@@ -150,8 +155,10 @@ PAGE_FETCH_SCHEMA = {
         "type": "object",
         "properties": {
             "url": {"type": "string", "description": "http(s) URL of the page"},
-            "mode": {"type": "string", "enum": ["text", "links", "listings"],
+            "mode": {"type": "string", "enum": ["text", "links", "listings", "structure"],
                      "description": "default text"},
+            "render": {"type": "boolean", "description": "structure only: true = always load "
+                       "in the headless browser, false = never; default: when needed"},
             "find": {"type": "string", "description": "optional words to filter by"},
             "max_chars": {"type": "integer", "description": "1000-12000, default 6000"},
         },
@@ -162,12 +169,23 @@ PAGE_FETCH_SCHEMA = {
 
 
 def handle_page_fetch(args: dict[str, Any], fetcher_factory: Callable[[], Any] | None = None,
-                      **_kw: Any) -> str:
+                      renderer: Any = None, base: str | None = None, **_kw: Any) -> str:
     args = dict(args or {})
     url = str(args.get("url") or "").strip()
     mode = args.get("mode") or "text"
-    if mode not in ("text", "links", "listings"):
-        return _fail("mode must be text, links or listings")
+    if mode not in ("text", "links", "listings", "structure"):
+        return _fail("mode must be text, links, listings or structure")
+    if mode == "structure":
+        try:
+            fetcher = fetcher_factory() if fetcher_factory else watchlib.Fetcher(
+                os.path.join(base or watchlib.WATCH_DIR, ".cookies", "_page_fetch.txt"))
+            out = recipes.structure(url, fetcher, renderer, args.get("render"), base)
+        except watchlib.WatchError as exc:
+            return _fail(exc.code, message=str(exc)[:300])
+        return _ok(mode="structure", **out, how=(
+            "To watch one: watch_manage action=preview with url and candidate=<number> (plus "
+            "name, schedule, include/exclude/max_price/criteria as asked), show the user the "
+            "sample, and create only after they agree."))
     try:
         out = watchlib.read_page(url, mode=mode, find=args.get("find"),
                                  max_chars=args.get("max_chars") or 6000,
@@ -190,12 +208,16 @@ WATCH_MANAGE_SCHEMA = {
         "'preview' (test a definition without saving: what it would match now), 'create', "
         "'list', 'update' (change filters/criteria/schedule/name of 'slug'), 'pause', 'resume', "
         "'delete', 'run' (check now). Workflow for a new request: preview -> show the user the "
-        "count and a few matches -> create. Sources: 'hardverapro' (url = a hardverapro.hu "
+        "count and a few matches and ASK whether this is what they want -> create only after "
+        "they agree (create refuses a definition that was not previewed). Sources: 'hardverapro' (url = a hardverapro.hu "
         "/aprok/ category page or https://hardverapro.hu/aprok/keres.php?stext=<words>), "
         "'cinemacity' (url = https://www.cinemacity.hu/ and include = one or two distinctive "
         "words of the film's Hungarian title, e.g. ['doom']; a hit means tickets can be booked; "
-        "never guess a film page URL or id), 'page' (any page; items = links "
-        "whose text has the words). 'include' = all of these words must be in the title, "
+        "never guess a film page URL or id), 'page' (ANY other public page: first call page_fetch "
+        "mode=structure on it, then pass candidate=<number> from that answer - it brings the "
+        "recipe (extract) and render settings; never write an extract by hand when a candidate "
+        "fits; a 'condition' candidate (in_stock, price below/above a value) notifies each time "
+        "it becomes true - set its value for below/above via extract). 'include' = all of these words must be in the title, "
         "'any' = at least one, 'exclude' = none (case and accent insensitive). Put conditions "
         "that need reading the ad (condition, 'not mined', 'with warranty') into 'criteria' "
         "and set fetch_details=true. The first run records the items already listed and only "
@@ -225,6 +247,13 @@ WATCH_MANAGE_SCHEMA = {
             "fetch_details": {"type": "boolean", "description": "read each new ad's own page "
                               "for the criteria (hardverapro)"},
             "stop_after_hit": {"type": "boolean", "description": "pause after the first hit"},
+            "candidate": {"type": "integer", "description": "source 'page': the number of a "
+                          "candidate from page_fetch mode=structure on the same url (last 2 h)"},
+            "extract": {"type": "object", "description": "source 'page': the recipe; normally "
+                        "from 'candidate'. For a condition candidate with below/above, pass the "
+                        "candidate's extract with your 'value' (a number)"},
+            "render": {"type": "boolean", "description": "load the page in the headless "
+                       "browser (set by the candidate)"},
             "schedule": {"type": "string", "description": "'N times a day' = a cron expression "
                          "at daytime hours, e.g. three times a day '15 8,13,19 * * *'; or an "
                          "interval 'every 4h' (at most every 30 min)"},
@@ -235,16 +264,17 @@ WATCH_MANAGE_SCHEMA = {
 }
 
 DEF_KEYS = ("name", "source", "url", "include", "any", "exclude", "min_price", "max_price",
-            "criteria", "fetch_details", "stop_after_hit", "schedule")
+            "criteria", "fetch_details", "stop_after_hit", "schedule", "extract", "render")
 UPDATABLE = ("name", "include", "any", "exclude", "min_price", "max_price", "criteria",
-             "fetch_details", "stop_after_hit", "schedule")
+             "fetch_details", "stop_after_hit", "schedule", "extract", "render")
 
 
 class WatchManager:
     def __init__(self, cron: Cron | None = None, base: str | None = None,
                  scripts_dir: str | None = None, fetcher_factory: Callable[[str], Any] | None = None,
-                 publish: Callable[[dict], Any] | None = None) -> None:
+                 publish: Callable[[dict], Any] | None = None, renderer: Any = None) -> None:
         self.cron = cron or Cron()
+        self.renderer = renderer
         self.base = base
         self.scripts_dir = scripts_dir
         self.fetcher_factory = fetcher_factory
@@ -257,6 +287,18 @@ class WatchManager:
 
     def _definition(self, args: dict[str, Any], slug: str) -> dict[str, Any]:
         cfg = {k: args.get(k) for k in DEF_KEYS if args.get(k) is not None}
+        if args.get("candidate") is not None:
+            if not isinstance(cfg.get("url"), str):
+                raise watchlib.ConfigError("candidate needs the url it was read from")
+            c = recipes.candidate_from_cache(cfg["url"].strip(), int(args["candidate"]), self.base)
+            extract = dict(c["extract"])
+            if isinstance(cfg.get("extract"), dict):           # e.g. the value of a condition
+                extract.update({k: v for k, v in cfg["extract"].items() if k in ("value",)})
+            cfg["extract"] = extract
+            cfg.setdefault("render", c.get("render") or None)
+            cfg["source"] = "page"
+            if cfg.get("render") is None:
+                cfg.pop("render")
         if "source" not in cfg and isinstance(cfg.get("url"), str):
             cfg["source"] = watchlib.source_for_url(cfg["url"])
         cfg["slug"] = slug
@@ -274,9 +316,11 @@ class WatchManager:
 
     def preview(self, args):
         cfg = self._definition(args, "preview")
-        out = watchlib.preview(cfg, self._fetcher(None))
+        out = watchlib.preview(cfg, self._fetcher(None), self.renderer, self.base)
+        recipes.remember_preview(cfg, self.base)
         return _ok(action="preview", definition=_public(cfg), now=out,
-                   note="Nothing saved. Show the user the count and a few matches, then create.")
+                   note="Nothing saved. Show the user the count and a few matches and ask whether "
+                        "to create it; call create with the same definition after they agree.")
 
     def create(self, args):
         existing = watchlib.list_configs(self.base)
@@ -291,9 +335,12 @@ class WatchManager:
             slug = f"{base_slug[:36]}-{n}"
             n += 1
         cfg = self._definition(args, slug)
+        if not recipes.was_previewed(cfg, self.base):
+            return _fail("preview_required", message="call action=preview with this definition, "
+                         "show the user the sample and ask; then create")
         cfg["created_at"] = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
         fetcher = self._fetcher(slug)
-        now = watchlib.preview(cfg, fetcher)          # fails before anything is written
+        now = watchlib.preview(cfg, fetcher, self.renderer, self.base)   # fails before writing
         watchlib.save_config(cfg, self.base)
         wrapper = watchlib.write_wrapper(slug, self.scripts_dir)
         res = self.cron.call(action="create", name=JOB_PREFIX + slug, schedule=cfg["schedule"],
@@ -305,7 +352,8 @@ class WatchManager:
         cfg["job_id"] = str(res.get("job_id") or "")[:64]
         watchlib.save_config(cfg, self.base)
         try:      # first run now: the baseline (and the watch_def card for the backend)
-            first = watchlib.run_watch(slug, fetcher=fetcher, publish=self.publish, base=self.base)
+            first = watchlib.run_watch(slug, fetcher=fetcher, publish=self.publish, base=self.base,
+                                       renderer=self.renderer)
         except watchlib.WatchError as exc:
             first = {"status": "error", "error": str(exc)[:200]}
         return _ok(action="create", slug=slug, job_id=cfg["job_id"], schedule=cfg["schedule"],
@@ -331,11 +379,23 @@ class WatchManager:
         slug = self._slug(args)
         cfg = watchlib.load_config(slug, self.base)
         changes = {k: args[k] for k in UPDATABLE if k in args and args[k] is not None}
+        if args.get("candidate") is not None:
+            c = recipes.candidate_from_cache(cfg["url"], int(args["candidate"]), self.base)
+            changes["extract"] = {**c["extract"], **{k: v for k, v in (args.get("extract") or {}).items()
+                                                      if k == "value"}}
+            changes["render"] = bool(c.get("render"))
         if not changes:
             return _fail(f"nothing to update; updatable: {', '.join(UPDATABLE)}")
         if "schedule" in changes:
             changes["schedule"] = check_schedule(changes["schedule"], self.cron)
-        new = watchlib.validate_config({**cfg, **changes})
+        merged = {**cfg, **changes}
+        if merged.get("render") is False:
+            merged.pop("render")
+        new = watchlib.validate_config(merged)
+        if (new.get("extract"), new.get("render")) != (cfg.get("extract"), cfg.get("render")) \
+                and not recipes.was_previewed(new, self.base):
+            return _fail("preview_required", message="a new recipe: preview it (with url and the "
+                         "new extract/candidate), show the user the sample, then update")
         if new.get("schedule") != cfg.get("schedule") and cfg.get("job_id"):
             res = self.cron.call(action="update", job_id=cfg["job_id"], schedule=new["schedule"])
             if not res.get("success"):
@@ -373,7 +433,7 @@ class WatchManager:
     def run(self, args):
         slug = self._slug(args)
         out = watchlib.run_watch(slug, fetcher=self._fetcher(slug), publish=self.publish,
-                                 base=self.base)
+                                 base=self.base, renderer=self.renderer)
         return _ok(action="run", result=_localize(out))
 
     def _remove_files(self, slug: str) -> None:

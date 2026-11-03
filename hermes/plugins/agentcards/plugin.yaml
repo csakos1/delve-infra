@@ -1,6 +1,6 @@
 name: agentcards
-version: "0.2.0"
-description: "Delve tools: card publishing (publish_*_card) for the phone dashboard, page_fetch (one public web page, compact and bounded) and watch_manage (no-agent watcher jobs)."
+version: "0.3.0"
+description: "Delve tools: card publishing (publish_*_card) for the phone dashboard, page_fetch (one public web page, compact and bounded) and watch_manage (no-agent watcher jobs, on any public page through recipes)."
 author: "csakos"
 provides_tools:
   - publish_water_card

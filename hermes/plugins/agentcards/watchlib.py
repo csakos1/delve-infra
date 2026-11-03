@@ -716,8 +716,29 @@ def slugify(name: str) -> str:
 def def_hash(cfg: dict[str, Any]) -> str:
     keys = ("source", "url", "include", "any", "exclude", "min_price", "max_price",
             "criteria", "fetch_details", "stop_after_hit", "notify_existing", "name", "schedule")
-    blob = json.dumps({k: cfg.get(k) for k in keys}, sort_keys=True, ensure_ascii=False)
+    d = {k: cfg.get(k) for k in keys}
+    for k in ("extract", "render"):         # only when present: older watchers keep their hash
+        if cfg.get(k):
+            d[k] = cfg[k]
+    blob = json.dumps(d, sort_keys=True, ensure_ascii=False)
     return short_id(blob)
+
+
+def _recipes() -> Any:
+    """recipes.py, imported lazily (it imports this module) and from the same place as this
+    module: the plugin package inside the gateway, top level for the cron wrapper and tests."""
+    if __package__:
+        from . import recipes
+    else:
+        import recipes  # type: ignore[no-redef]
+    return recipes
+
+
+def _recipe_hash(cfg: dict[str, Any]) -> str | None:
+    if not cfg.get("extract") and not cfg.get("render"):
+        return None
+    return short_id(json.dumps({"e": cfg.get("extract"), "r": bool(cfg.get("render"))},
+                               sort_keys=True, ensure_ascii=False))
 
 
 def validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -733,8 +754,10 @@ def validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
     clean.pop("def_hash", None)
     src = SOURCES[clean["source"]]
     clean["url"] = src.validate_url(clean["url"])
-    if clean["source"] == "page" and not (clean["include"] or clean["any"]):
-        raise ConfigError("page: give at least one include or any word")
+    if clean["source"] == "page" and not (clean["include"] or clean["any"]) \
+            and cfg.get("extract") is None:
+        raise ConfigError("page: give a recipe (extract, from page_fetch mode=structure) or "
+                          "at least one include or any word")
     if clean["source"] == "cinemacity" and CinemaCity().film_id(clean["url"]) is None \
             and not (clean["include"] or clean["any"]):
         raise ConfigError("cinemacity: give include words of the film title (or the film page URL)")
@@ -746,6 +769,16 @@ def validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
     if "notify_existing" not in cfg or cfg.get("notify_existing") is None:
         # "tell me when tickets are on sale": a film already bookable is news too
         clean["notify_existing"] = bool(clean["stop_after_hit"]) or clean["source"] == "cinemacity"
+    if cfg.get("extract") is not None or cfg.get("render"):
+        if clean["source"] != "page":
+            raise ConfigError("extract and render are for source 'page'")
+        recipes = _recipes()
+        if cfg.get("extract") is not None:
+            clean["extract"] = recipes.validate_extract(cfg["extract"])
+        if cfg.get("render"):
+            clean["render"] = True
+        if clean.get("extract", {}).get("mode") == "condition" and cfg.get("notify_existing") is None:
+            clean["notify_existing"] = True      # "tell me when it is in stock": already is = news
     for k in ("job_id", "created_at"):
         if isinstance(cfg.get(k), str):
             clean[k] = cfg[k][:64]
@@ -788,7 +821,8 @@ def list_configs(base: str | None = None) -> list[dict[str, Any]]:
     out = []
     with contextlib.suppress(FileNotFoundError):
         for name in sorted(os.listdir(d)):
-            if name.endswith(".json") and not name.endswith(".state.json"):
+            if name.endswith(".json") and not name.endswith(".state.json") \
+                    and not name.startswith("."):
                 slug = name[:-5]
                 try:
                     out.append(load_config(slug, base))
@@ -826,10 +860,14 @@ def _iso(now: dt.datetime) -> str:
     return now.astimezone(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def collect(cfg: dict[str, Any], fetcher: Fetcher) -> tuple[list[dict], list[dict], Page]:
-    """Fetch and filter: (all items, matching items, page)."""
-    src = SOURCES[cfg["source"]]
-    items, page = src.items(fetcher, cfg["url"])
+def collect(cfg: dict[str, Any], fetcher: Fetcher, state: dict[str, Any] | None = None,
+            renderer: Any = None, base: str | None = None) -> tuple[list[dict], list[dict], Page]:
+    """Fetch and filter: (all items, matching items, page). A 'page' watcher goes through
+    recipes (robots.txt, optional rendering, the extract recipe or plain links)."""
+    if cfg["source"] == "page":
+        items, page = _recipes().collect(cfg, fetcher, renderer, state, base)
+    else:
+        items, page = SOURCES[cfg["source"]].items(fetcher, cfg["url"])
     matched = [i for i in items if item_matches(i, cfg)]
     return items, matched, page
 
@@ -873,7 +911,7 @@ def _default_publisher() -> Publisher:
 
 def run_watch(slug: str, *, dry_run: bool = False, fetcher: Fetcher | None = None,
               publish: Publisher | None = None, base: str | None = None,
-              now: dt.datetime | None = None) -> dict[str, Any]:
+              now: dt.datetime | None = None, renderer: Any = None) -> dict[str, Any]:
     """One watcher run. Returns a summary; raises WatchError (with exit_code) on failure,
     after publishing an error ``watch_run`` card (not in dry-run)."""
     started = time.monotonic()
@@ -899,12 +937,23 @@ def run_watch(slug: str, *, dry_run: bool = False, fetcher: Fetcher | None = Non
     if st.get("def_hash") != h:
         emit("watch_def", {**{k: cfg.get(k) for k in CONFIG_FIELDS if cfg.get(k) is not None},
                            "def_hash": h})
-        if st.get("url") not in (None, cfg["url"]):   # a new source: start a new baseline
-            st["seen"] = {}
+        rh = _recipe_hash(cfg)
+        if st.get("url") not in (None, cfg["url"]) or st.get("recipe", rh) != rh:
+            st["seen"] = {}                      # a new source or recipe: a new baseline
             st.pop("baseline_at", None)
+            st.pop("cond", None)
+        if rh:
+            st["recipe"] = rh
+        else:
+            st.pop("recipe", None)
 
+    work = dict(st) if dry_run else st
     try:
-        items, matched, page = collect(cfg, fetcher)
+        items, matched, page = collect(cfg, fetcher, work, renderer, base)
+        if cfg.get("extract", {}).get("mode") in ("list", "json") and not items \
+                and int(st.get("last_items", 0)) > 0:
+            raise ParseError(f"the recipe found nothing (last time {st['last_items']} items): "
+                             "the page has probably changed", "recipe_empty")
     except WatchError as exc:
         if not dry_run:
             st["errors"] = int(st.get("errors", 0)) + 1
@@ -927,7 +976,7 @@ def run_watch(slug: str, *, dry_run: bool = False, fetcher: Fetcher | None = Non
     else:
         announce = new[:MAX_CANDIDATES]
 
-    excerpts: dict[str, str | None] = {}
+    excerpts: dict[str, str | None] = {i["item_id"]: i["text"] for i in announce if i.get("text")}
     if cfg.get("fetch_details") and SOURCES[cfg["source"]].has_details:
         for item in announce[:MAX_DETAILS]:
             try:
@@ -947,6 +996,7 @@ def run_watch(slug: str, *, dry_run: bool = False, fetcher: Fetcher | None = Non
             {k: i.get(k) for k in ("item_id", "title", "price", "location", "posted", "url")
              if i.get(k)} for i in (new or matched)[:10]]}
 
+
     back = reserved_changes(st, matched, seen, stamp, now)
     for item in announce:
         emit("watch_candidate", _candidate_payload(slug, item, excerpts.get(item["item_id"])))
@@ -955,7 +1005,8 @@ def run_watch(slug: str, *, dry_run: bool = False, fetcher: Fetcher | None = Non
     emit("watch_run", summary)
     for item in new:
         seen[item["item_id"]] = stamp
-    st.update({"v": 1, "def_hash": h, "url": cfg["url"], "last_ok_at": stamp, "errors": 0})
+    st.update({"v": 1, "def_hash": h, "url": cfg["url"], "last_ok_at": stamp, "errors": 0,
+               "last_items": len(items)})
     st.pop("last_error", None)
     st.setdefault("baseline_at", stamp)
     try:
@@ -967,15 +1018,24 @@ def run_watch(slug: str, *, dry_run: bool = False, fetcher: Fetcher | None = Non
     return summary
 
 
-def preview(cfg: dict[str, Any], fetcher: Fetcher | None = None) -> dict[str, Any]:
+def preview(cfg: dict[str, Any], fetcher: Fetcher | None = None, renderer: Any = None,
+            base: str | None = None) -> dict[str, Any]:
     """Fetch + filter a (not yet saved) config: what the watcher would see now."""
     cfg = validate_config(cfg)
     fetcher = fetcher or Fetcher()
     SOURCES[cfg["source"]].verify(fetcher, cfg)
-    items, matched, page = collect(cfg, fetcher)
-    return {"items": len(items), "matched": len(matched), "final_url": page.final_url,
-            "sample": [{k: i.get(k) for k in ("title", "price", "location", "posted", "url")
-                        if i.get(k)} for i in matched[:8]]}
+    items, matched, page = collect(cfg, fetcher, {}, renderer, base)
+    mode = cfg.get("extract", {}).get("mode")
+    if mode in ("list", "json") and not items:
+        raise ParseError("the recipe finds nothing on the page now; pick another candidate",
+                         "recipe_empty")
+    out = {"items": len(items), "matched": len(matched), "final_url": page.final_url,
+           "sample": [{k: _clip(str(i[k]), 160) if k == "text" else i[k]
+                       for k in ("title", "price", "location", "posted", "url", "text")
+                       if i.get(k)} for i in matched[:8]]}
+    if mode == "condition":
+        out["condition_true_now"] = bool(items)
+    return out
 
 
 # --- page reading (the page_fetch tool) ------------------------------------------------

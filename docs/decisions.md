@@ -208,6 +208,51 @@ hit (the user's choice: mark the hit, then say when it is available). `watch_run
 `error_code` may contain digits (`http_404`): the old pattern rejected it, and the error
 card of an HTTP failure was silently dropped.
 
+**D-44 A watcher on any page is a recipe - data, not code (W5).** For a site without a
+hand-written source the watcher config carries `extract`: `list` (an item selector and
+field selectors), `json` (a list in the page's JSON, its `__NEXT_DATA__`, its JSON-LD, a
+`<script type="application/json">`, or an API URL seen while rendering - read directly
+when it answers plain HTTP, else by loading the page and taking the browser's answer) or `condition`
+(one fact of one page: `in_stock` / price `below` / `above` from schema.org Product data,
+or `contains` / `absent` / a number in a CSS-selected element or the page text). A fixed
+engine (`recipes.py`, stdlib) runs it; the model never writes one from nothing: `page_fetch
+mode=structure` proposes numbered candidates with real sample items (embedded JSON scores a
+little higher than CSS - class names change with every site build), `watch_manage` takes
+`candidate=<n>`. A recipe that found items and then finds none fails the run with
+`recipe_empty` (the page changed: the app's error card and "Fix in chat"). A new recipe
+starts a new baseline. The `watch_def` card is unchanged (the backend needs no update).
+
+**D-45 Creating a watcher needs a preview of the same definition, and the user's yes
+(W5).** `create` (and an `update` that changes the recipe) refuses a definition that was
+not previewed in the last 2 hours (source, URL, filters, recipe, rendering); the tool
+description and SOUL rule 5 tell the model to show the sample items and ask first. The
+user's choice: always confirm with real samples before anything is scheduled.
+
+**D-46 Rendering with Playwright and the system Chromium, behind a filtering proxy (W5).**
+Pages built by JavaScript, or refused to plain HTTP clients by bot protection (measured:
+ikea.com answers urllib with 403, the browser gets the page), are loaded by
+`render_page.py` in its own venv (`~/.hermes/delve-render/venv`, Playwright only; the
+browser is the `chromium` package, updated by pacman; the Hermes venv is not touched). It
+runs as a subprocess, one at a time (`watches/.render.lock`), ~3-6 s and ~1.2-1.5 GB peak
+(W5-0, sum over the process tree). Every connection of the browser - the page, redirects,
+scripts, XHR, WebSockets - goes through a proxy inside `render_page.py` that resolves the
+host once, applies D-41 to every answer and connects to the checked address; loopback is
+sent to the proxy too (`<-loopback>`). This closes D-41's DNS-rebinding gap for rendered
+pages, and Playwright's own `route()` - which does not see redirect targets - is not relied
+on. Images, media and fonts are not loaded, service workers are blocked, the Chromium
+sandbox stays on. The user agent is Chromium's with `HeadlessChrome` replaced and
+`delve-watch/0.1` appended. Measured alternatives: the Hermes `browser` toolset
+(`agent-browser`, made for the model to drive), Lightpanda (not installed, less
+compatible); "no JavaScript for now" was the fallback.
+
+**D-47 robots.txt is obeyed for 'page' watchers (W5).** RFC 9309 with the token
+`delve-watch`: rules are cached 24 h per host; a 4xx robots.txt means no rules; 5xx or no
+answer means everything is disallowed (an older cached copy is used if there is one).
+`watch_manage` refuses a disallowed URL (`robots_disallowed`), a run fails with it, and
+`page_fetch mode=structure` reports it up front. The hand-written sources were checked by
+hand (hardverapro: no paging). The user's choice; many shops disallow their search pages
+but allow categories.
+
 ## Rejected or deferred
 
 | Option | Outcome | Reason |
@@ -224,3 +269,6 @@ card of an HTTP failure was silently dropped.
 | Backend running as `agent` | rejected | would see the agent's secrets |
 | Hermes web toolset (`web_search`/`web_extract`) | deferred | needs an outside provider; `page_fetch` covers reading (D-40); search maybe later via `ddgs` with `web.keyless_fallback: false` |
 | Hermes agent-mode cron / `monitor` for watchers | rejected | model calls outside the backend queue on the single slot (D-38) |
+| Hermes `browser` toolset for watchers | rejected | made for the model to drive a page; watchers run without the model (D-38, D-46) |
+| Model-written CSS selectors | rejected | the 27B invents; candidates with real samples instead (D-44) |
+| Playwright `route()` as the URL guard | rejected | it does not see redirect targets; a proxy does (D-46) |

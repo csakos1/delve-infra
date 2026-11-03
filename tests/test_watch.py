@@ -561,8 +561,10 @@ class Manage(unittest.TestCase):
 
     def test_failed_fetch_writes_nothing(self):
         self.pages = {}
-        out = self.call(action="create", name="nincs", url=HA_SEARCH, schedule="every 4h")
+        out = self.call(action="preview", name="nincs", url=HA_SEARCH, schedule="every 4h")
         self.assertEqual((out["success"], out["error"]), (False, "http_404"))
+        out = self.call(action="create", name="nincs", url=HA_SEARCH, schedule="every 4h")
+        self.assertEqual((out["success"], out["error"]), (False, "preview_required"))
         self.assertFalse(os.path.exists(self.base) and os.listdir(self.base))
         self.assertEqual([c for c in self.cron.calls if c["action"] == "create"], [])
 

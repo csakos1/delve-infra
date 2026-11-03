@@ -95,8 +95,12 @@ wrong thing and puts the boundary where it cannot be talked around:
    JSONL file (`O_APPEND|O_NOFOLLOW`, `flock`, `0644`) after strict schema validation.
    `page_fetch` and the watchers take a URL but reach only public http(s) addresses
    (no loopback, private, link-local or tailnet answers, checked on every redirect;
-   `docs/decisions.md` D-41); `watch_manage` writes only its own files under
-   `~/.hermes/watches/` and `scripts/watch_<slug>.py`, from a fixed template.
+   `docs/decisions.md` D-41); a page loaded in the headless Chromium reaches the network
+   only through a proxy that applies the same rule to every connection (D-46); watchers
+   obey robots.txt (D-47). `watch_manage` writes only its own files under
+   `~/.hermes/watches/` and `scripts/watch_<slug>.py`, from a fixed template; a watcher on
+   any other site is a recipe (data) for a fixed engine, picked from candidates with real
+   samples and created only after a preview (D-44, D-45).
 6. **Secrets never enter command lines** (the agent can read the journal, including
    sudo's full command lines), and never enter this repository: see
    [Repository hygiene](#repository-hygiene).
@@ -122,7 +126,9 @@ hermes/
   cron/balaton-water.sh     idempotent creation of the water-level cron job
   cron/arch-updates.sh      idempotent creation of the package-update cron job
   plugins/agentcards/       Hermes plugin: card schema, validator, JSONL store, tools
-                            (publish_water_card, page_fetch, watch_manage), watchlib.py
+                            (publish_water_card, page_fetch, watch_manage), watchlib.py,
+                            recipes.py (recipes on any page), render_page.py (headless
+                            Chromium behind a filtering proxy; runs in its own venv)
   scripts/water_level.py    no-agent cron script: lake gauge → `water` card (stdlib only)
   scripts/updates_check.py  no-agent cron script: checkupdates → `updates` card (stdlib only)
 ops/
@@ -247,6 +253,12 @@ This is a record of a working setup, not a turnkey installer. Paths use
     job `watch:<slug>` (no-agent, `deliver: local`); its log is `~/.hermes/logs/watch.log`.
     The helper's `agent.cron.list|pause|resume|run` verbs (step 16) let the backend show and
     control them: reinstall `bin/delve-helper` and check `sudo delve helper agent.cron.list`.
+    **Any page (W5):** `sudo pacman -S chromium`, then as the agent user
+    `python3 -m venv ~/.hermes/delve-render/venv && ~/.hermes/delve-render/venv/bin/pip
+    install playwright` (no `playwright install`: the system Chromium is used). Check:
+    `page_fetch` with `mode=structure` on a public page returns numbered candidates; on a
+    JavaScript page it says `"rendered": true`. Without the venv everything else works and
+    rendering fails with `render_unavailable`.
 19. **Reboot without logging in**, connect over SSH, run `ops/post-boot-check.sh`.
 
 ## Tests
@@ -259,6 +271,7 @@ This is a record of a working setup, not a turnkey installer. Paths use
 | `tests/test_water_schema.py` | CI + host | `water` payload validator: ranges, types, time window, unknown fields |
 | `tests/test_water_level.py` | CI + host | gauge table parser against the synthetic fixture + 13 malformed variants |
 | `tests/test_watch.py` | CI + host | watchers: public-address guard (incl. redirects), hardverapro / cinemacity / generic parsers on synthetic pages, filters, config rules, the run cycle (baseline, new items, cap, errors, `watch_*` cards), `page_fetch`, `watch_manage` against a fake Hermes cron |
+| `tests/test_recipes.py` | CI + host | recipes: selectors, JSON paths, recipe validation, list / JSON / condition extraction, the candidate finder on synthetic list / `__NEXT_DATA__` / product / API / JavaScript-shell pages, robots.txt (rules, 4xx, unreachable, cache), the run cycle (baseline, `recipe_empty`, recipe change, condition edges), `watch_manage` with candidates and the preview gate, the renderer wrapper; with Playwright and a Chromium also `render_page.py` itself (a JavaScript-built list, its API captured, a redirect and a fetch to loopback refused) |
 | fixture reproducibility | CI | `make_tohid_synthetic.py` and `make_watch_synthetic.py` regenerate byte-identical fixtures |
 | script dry-run | CI | `water_level.py --dry-run` and `updates_check.py --dry-run` produce valid v1 `water` / `updates` events |
 | gitleaks (push range; full history weekly and on demand) | CI | no secrets in any commit |
@@ -306,6 +319,8 @@ Run after any Hermes, `llama.cpp`, kernel or NVIDIA/CUDA update:
 9. Offline tests + `water_level.py --dry-run --force`.
 10. Cron job active, a manual run `succeeded`, no open incidents.
 11. `ops/config-check.py --fragment …` → all keys match; rendered sudoers byte-identical.
+12. After a Chromium or Playwright update: `tests/test_recipes.py` as the agent user with
+    `~/.hermes/delve-render/venv/bin/python` (the live renderer tests run, not skip).
 
 ## Measurements
 
@@ -338,6 +353,9 @@ desktop; RTX 3050 8 GB on a chipset x4 slot), 64K context, q8_0 KV cache, one sl
   items; `hardverapro` only reads the first result page (robots.txt forbids paging).
 - **The data source is a scraped HTML table.** A format change makes the script fail
   with exit code 2, which opens a Hermes cron incident instead of publishing bad data.
+- **Watchers on any page read the first screen of one URL.** No login, no captcha, no
+  infinite scrolling or paging; a site that redesigns its page breaks the recipe
+  (`recipe_empty`, fixed from chat with a new candidate).
 
 ## License
 

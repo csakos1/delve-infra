@@ -54,7 +54,7 @@ jobs:
         working-directory: /tmp
         run: |
           set -e
-          for t in test_water_level test_water_schema test_agentcards test_delve_helper test_updates_check test_watch; do
+          for t in test_water_level test_water_schema test_agentcards test_delve_helper test_updates_check test_watch test_recipes; do
             echo "::group::$t"
             python -I "$GITHUB_WORKSPACE/tests/$t.py"
             echo "::endgroup::"
