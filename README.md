@@ -87,6 +87,9 @@ wrong thing and puts the boundary where it cannot be talked around:
    (`tests/deny-matrix.py`, 19 cases) against Hermes' own matcher.
 3. **Localhost only.** Both the model server and the Hermes API server bind to
    `127.0.0.1`. Only the backend is exposed, and only on the tailnet (`tailscale serve`).
+   The app's terminal reaches OpenSSH on port 2222, from the tailnet only, with its own
+   key restricted to the tailnet range and without forwarding (D-48); the backend is not
+   on that path.
 4. **Behavioural rules** in `hermes/SOUL.md`: state facts about the system only from
    tool output; never modify an approved command (in testing the model escalated
    `rm -r` to `rm -rf` on its own); no retry in another form after a block; say so
@@ -115,7 +118,7 @@ bin/
   wait-llama.sh             ExecStartPre: wait up to 120 s for llama-server /health
 etc/
   gai.conf.fragment         prefer IPv4 in getaddrinfo()
-  ssh/sshd_config.d/        key-only SSH
+  ssh/sshd_config.d/        key-only SSH; 30-delve.conf: OpenSSH on 22 and 2222 (the app's terminal)
   sysusers.d/delve.conf     the backend's system user
   tmpfiles.d/delve-inbox.conf  the attachment inbox: 2750 delve:agent
   delve/helper.env.example  users and units the helper controls
@@ -259,7 +262,23 @@ This is a record of a working setup, not a turnkey installer. Paths use
     `page_fetch` with `mode=structure` on a public page returns numbered candidates; on a
     JavaScript page it says `"rendered": true`. Without the venv everything else works and
     rendering fails with `render_unavailable`.
-19. **Reboot without logging in**, connect over SSH, run `ops/post-boot-check.sh`.
+19. **Terminal (Delve T, SSH on 2222):** on the tailnet address port 22 is answered by
+    Tailscale SSH, so the app's terminal uses the real OpenSSH on 2222 (D-48):
+    ```sh
+    sudo install -m 0644 etc/ssh/sshd_config.d/30-delve.conf /etc/ssh/sshd_config.d/
+    sudo sshd -t && sudo systemctl reload sshd
+    sudo sshd -T | grep -i '^port '            # 22 and 2222
+    sudo firewall-cmd --get-zone-of-interface=tailscale0   # trusted; no 2222 in public
+    ```
+    The app creates its key and shows one line to copy (More → Settings → Terminal); paste
+    it into `~/.ssh/authorized_keys` of the operator from another session (Termux over
+    Tailscale SSH on 22). The line keeps
+    `from="100.64.0.0/10",no-agent-forwarding,no-X11-forwarding,no-port-forwarding`. The app
+    pins the host key on first use (compare with
+    `ssh-keyscan -p 2222 -t ed25519 127.0.0.1 | ssh-keygen -lf -`) and starts
+    `env LANG=en_US.UTF-8 tmux -u new-session -A -s <name>` (an exec channel has no locale);
+    the same session is reachable on the desktop with `tmux attach -t <name>`.
+20. **Reboot without logging in**, connect over SSH, run `ops/post-boot-check.sh`.
 
 ## Tests
 

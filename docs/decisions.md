@@ -253,6 +253,22 @@ answer means everything is disallowed (an older cached copy is used if there is 
 hand (hardverapro: no paging). The user's choice; many shops disallow their search pages
 but allow categories.
 
+**D-48 The app's terminal speaks SSH to the desktop directly, on port 2222 (T).** The phone
+opens an SSH session over the tailnet to the operator's account and attaches a tmux
+session; the backend is not on the path (it runs as `delve` in a sandbox and must not get
+a shell of the operator). Port 22 on the tailnet address belongs to Tailscale SSH (`none`
+auth, ACL check in the browser; measured from Termux: `server-sig-algs` with `ssh-dss`,
+which OpenSSH 10 no longer has), so OpenSSH also listens on 2222
+(`etc/ssh/sshd_config.d/30-delve.conf`, no Match block); firewalld's trusted `tailscale0`
+zone makes it tailnet-only. The app keeps its own ed25519 key in the Android keystore
+(secure storage); its `authorized_keys` line is restricted to `from="100.64.0.0/10"` and has
+no agent, X11 or port forwarding (checked: refused from 127.0.0.1, port forward refused).
+The host key is pinned on first use, a changed key stops the connection. The terminal
+unlocks with a fingerprint after 15 minutes unused. An exec channel has no `LANG` or
+`TERM`, so the session is `env LANG=en_US.UTF-8 tmux -u new-session -A -s <name>` on an
+`xterm-256color` pty. Termux over Tailscale SSH on 22 stays as the fallback and is how the
+key line is installed.
+
 ## Rejected or deferred
 
 | Option | Outcome | Reason |
@@ -272,3 +288,5 @@ but allow categories.
 | Hermes `browser` toolset for watchers | rejected | made for the model to drive a page; watchers run without the model (D-38, D-46) |
 | Model-written CSS selectors | rejected | the 27B invents; candidates with real samples instead (D-44) |
 | Playwright `route()` as the URL guard | rejected | it does not see redirect targets; a proxy does (D-46) |
+| Terminal through the backend | rejected | the backend runs sandboxed as `delve`; it must not hold a shell of the operator (D-48) |
+| Tailscale SSH for the app's terminal | rejected | any app on the phone's VPN could log in; the SSH library does not do its check mode (D-48) |
