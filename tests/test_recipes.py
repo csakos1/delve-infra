@@ -164,6 +164,28 @@ class Selectors(unittest.TestCase):
             recipes.check_field("a@bad attr", "link")
 
 
+class Generated(unittest.TestCase):
+    def test_names(self):
+        for n in ("swiper-wrapper-d1c39cc0b81ecc04", "Link__dPFjRI", "list__2Gh7vS", "css-1x2y3z",
+                  "sc-bdVaJa", "ember1234", "a3f9c2e1-77b0-4c1e-9d2a-0e5b6c7d8e9f", "item-4821"):
+            with self.subTest(n=n):
+                self.assertTrue(recipes.generated(n))
+        for n in ("card", "product-list__item", "plp-product-list__products--compare-enabled",
+                  "uad-col-title", "col-md-4", "h3", "MuiGrid-grid-xs-12", "footer-group",
+                  "hnf-accordion__item", "swiper-slide", "list-unstyled"):
+            with self.subTest(n=n):
+                self.assertFalse(recipes.generated(n))
+
+    def test_random_id_not_used_in_selector(self):
+        html = shop_html(4).replace("<ul class='products'>",
+                                    "<ul class='products' id='swiper-wrapper-d1c39cc0b81ecc04'>")
+        out = recipes.block_candidates(watchlib.parse_html(html), SHOP)
+        self.assertNotIn("swiper-wrapper", out[0]["extract"]["item"])
+        html = shop_html(4).replace("<ul class='products'>", "<ul class='products' id='termekek'>")
+        out = recipes.block_candidates(watchlib.parse_html(html), SHOP)
+        self.assertTrue(out[0]["extract"]["item"].startswith(("#termekek", "ul.products")))
+
+
 class JsonPaths(unittest.TestCase):
     def test_paths(self):
         d = {"a": {"b": [{"c": 1}, {"c": 2}, {"x": 3}]}, "@graph": [{"k": "v"}], "8000": [5]}

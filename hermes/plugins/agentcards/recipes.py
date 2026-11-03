@@ -62,6 +62,22 @@ NOISE_CLASS = re.compile(r"\d{3,}|^(active|selected|odd|even|first|last|hidden|v
                          r"is-[\w-]+|js-[\w-]+|ng-[\w-]+|css-[\w-]+|sc-[\w-]+)$")
 
 
+def generated(name: str) -> bool:
+    """A class or id that a build or a page script made up and that changes between builds
+    or page loads: 'swiper-wrapper-d1c39cc0b81ecc04', 'Link__dPFjRI', 'list__2Gh7vS',
+    'css-1x2y3z', 'ember123', a UUID. Words, BEM names and short numbers stay."""
+    if NOISE_CLASS.search(name):
+        return True
+    if re.search(r"__[A-Za-z0-9]{5,}$", name) and re.search(r"[0-9]|[a-z][A-Z]|[A-Z][a-z][A-Z]",
+                                                            name.rsplit("__", 1)[1]):
+        return True                          # CSS modules / styled names: Block__hash
+    for seg in re.split(r"[-_:.]+", name):
+        if len(seg) >= 5 and re.search(r"\d", seg) and re.search(r"[A-Za-z]", seg) \
+                and len(re.findall(r"\d", seg)) >= 2:
+            return True                      # hex / base62 chunks: d1c39cc0b81ecc04, 1x2y3z
+    return False
+
+
 class RecipeError(wl.ParseError):
     code = "recipe_empty"
 
@@ -704,7 +720,7 @@ def collect(cfg: dict[str, Any], fetcher: Any, renderer: Renderer | None = None,
 
 
 def _clean_classes(n: wl.Node) -> list[str]:
-    return sorted(c for c in n.classes() if not NOISE_CLASS.search(c) and re.fullmatch(r"[\w-]+", c))[:3]
+    return sorted(c for c in n.classes() if not generated(c) and re.fullmatch(r"[\w-]+", c))[:3]
 
 
 def _sig(n: wl.Node) -> str:
@@ -713,7 +729,7 @@ def _sig(n: wl.Node) -> str:
 
 def _own(n: wl.Node) -> str:
     i = n.attrs.get("id")
-    if i and re.fullmatch(r"[A-Za-z][\w-]*", i) and not re.search(r"\d{3,}", i):
+    if i and re.fullmatch(r"[A-Za-z][\w-]*", i) and not generated(i):
         return "#" + i
     return _sig(n)
 
@@ -843,7 +859,7 @@ def _groups(parent: wl.Node) -> list[tuple[str, list[wl.Node]]]:
 
 
 def _clean_classes_all(n: wl.Node) -> list[str]:
-    return [c for c in n.classes() if not NOISE_CLASS.search(c) and re.fullmatch(r"[\w-]+", c)]
+    return [c for c in n.classes() if not generated(c) and re.fullmatch(r"[\w-]+", c)]
 
 
 def quality(items: list[dict[str, Any]], base: str) -> tuple[float, dict[str, float]]:
