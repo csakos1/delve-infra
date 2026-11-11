@@ -8,6 +8,7 @@ echo "=== net ==="; ip -br link | grep -Ei 'proton|pvpn|tailscale'; tailscale st
 echo "=== llama (s boot óta) ==="
 journalctl --user -u llama-server -b -o short-monotonic --no-pager | grep -Ei 'Started|listening|model loaded' | head -5
 curl -s -m 2 127.0.0.1:8080/health; echo
+echo "preset: $(readlink "$HOME/.config/delve/llama/active.env" 2>/dev/null || echo '? (no active.env)')"
 echo "=== delve-backend ==="
 systemctl show delve-backend -p ActiveState -p NRestarts -p ExecMainStartTimestampMonotonic
 journalctl -u delve-backend -b -o cat --no-pager | grep -E '"(startup|hermes health changed)"' | tail -3

@@ -269,6 +269,32 @@ unlocks with a fingerprint after 15 minutes unused. An exec channel has no `LANG
 `xterm-256color` pty. Termux over Tailscale SSH on 22 stays as the fallback and is how the
 key line is installed.
 
+## Model presets (Delve M)
+
+**D-49 One preset file per model; `active.env` names the loaded one.** The loaded model is
+a state of the machine, not of a chat: one model fits the GPUs at a time, and every caller
+(agent runs, schedules, the watch judge, Hermes' title and compression calls) talks to the
+same `llama-server`. A preset is a systemd `EnvironmentFile` in the operator's
+`~/.config/delve/llama/`: the `LLAMA_ARG_*` variables `llama-server` reads itself (model,
+projector, context, GPU split, KV cache, sampling), `LLAMA_EXTRA_ARGS` for switches without
+a value, and `DELVE_*` lines for the app (label, note, thinking mode). Host, port, the
+single slot and the metrics endpoint stay on the unit's command line, which wins over the
+environment, so a preset cannot change them. Presets are hand-tuned files because every
+model needs its own split across unequal GPUs; nothing discovers GGUF files by itself.
+The symlink survives a reboot: the machine comes back with the model chosen last.
+`llama-server`'s own router mode was not used: there the request's `model` field selects
+the model, so Hermes, the backend and other clients would each have to name the loaded
+one, and the monitoring endpoints take a model name.
+
+**D-50 The helper lists and selects presets, nothing more.** `llama.models` runs the
+helper's own file as `--presets <dir>` in the operator's user manager (as `agent.cron.list`
+reads the agent's files) and treats the answer as data. `llama.select <preset>` checks the
+name (`[a-z0-9][a-z0-9._-]{0,39}`), that the preset exists and is usable (model and
+projector files exist, context at least 65536 - D-04), then moves the symlink. It does not
+restart anything: the backend stops and starts the unit around it with the existing verbs,
+holds its queue meanwhile, and goes back to the previous preset when the new one does not
+come up. The backend can only choose among files the operator wrote.
+
 ## Rejected or deferred
 
 | Option | Outcome | Reason |
@@ -289,4 +315,5 @@ key line is installed.
 | Model-written CSS selectors | rejected | the 27B invents; candidates with real samples instead (D-44) |
 | Playwright `route()` as the URL guard | rejected | it does not see redirect targets; a proxy does (D-46) |
 | Terminal through the backend | rejected | the backend runs sandboxed as `delve`; it must not hold a shell of the operator (D-48) |
+| `llama-server` router mode for switching models | rejected | the `model` field would select the model for every caller (D-49) |
 | Tailscale SSH for the app's terminal | rejected | any app on the phone's VPN could log in; the SSH library does not do its check mode (D-48) |

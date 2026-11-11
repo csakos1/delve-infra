@@ -7,21 +7,31 @@ no capabilities, no devices), so the few things it needs root or another user fo
 through here, as fixed verbs:
 
     llama.status  llama.start  llama.stop  hermes.status  gpu.status
-    host.status   agent.incidents  agent.cron.list
+    host.status   agent.incidents  agent.cron.list  llama.models
     agent.cron.pause <job id>  agent.cron.resume <job id>  agent.cron.run <job id>
+    llama.select <preset>
 
 Request:  one JSON line  {"verb": "<verb>"}                       (at most 1 KiB)
-          or, for the verbs that name a job, {"verb": "<verb>", "arg": "<job id>"}
-          (a Hermes job id: 6-32 lowercase hex characters)
+          or, for the verbs that take one, {"verb": "<verb>", "arg": "<job id or preset>"}
+          (a Hermes job id: 6-32 lowercase hex characters; a preset name: a lowercase
+          letter or digit, then up to 39 of a-z 0-9 . _ -)
 Response: one JSON line  {"ok": true, "verb": "<verb>", "data": {...}}
                      or  {"ok": false, "error": "<code>", "message": "<text>"}
 
-Error codes: bad_request, unknown_verb, unit_not_found, failed, timeout.
+Error codes: bad_request, unknown_verb, unit_not_found, unknown_model, model_not_usable,
+failed, timeout.
+
+Model presets: one systemd environment file per model in the llama user's
+`~/.config/delve/llama/<preset>.env` (see `llama/presets/`); `active.env` there is a
+symlink to the one `llama-server.service` loads. `llama.models` lists them, `llama.select`
+moves the symlink and nothing else: the backend stops and starts the unit around it. The
+directory is read as its owner, by running this file there as `--presets <dir>`.
 
 Settings come from the environment (`/etc/delve/helper.env`, see
 `etc/delve/helper.env.example`): LLAMA_USER, LLAMA_UNIT, AGENT_USER, HERMES_UNIT,
 HERMES_BIN (for the agent.* verbs), AGENT_HERMES_HOME (for agent.cron.list; default
-/home/<AGENT_USER>/.hermes).
+/home/<AGENT_USER>/.hermes), LLAMA_PRESET_DIR (default
+/home/<LLAMA_USER>/.config/delve/llama).
 Only the standard library is used; no shell is involved.
 """
 
@@ -48,6 +58,9 @@ CRON_LIST_MAX = 2 * 1024 * 1024
 SYSTEMCTL = "/usr/bin/systemctl"
 SYSTEMD_RUN = "/usr/bin/systemd-run"
 NVIDIA_SMI = "/usr/bin/nvidia-smi"
+PYTHON = "/usr/bin/python3"
+LN = "/usr/bin/ln"
+SELF = "/usr/local/lib/delve/delve-helper"  # where the units install this file
 PROC = "/proc"  # replaced in tests
 
 CHILD_ENV = {
@@ -58,6 +71,15 @@ CHILD_ENV = {
 }
 
 JOB_ID_RE = re.compile(r"[0-9a-f]{6,32}")
+PRESET_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,39}")
+PRESET_SUFFIX = ".env"
+ACTIVE_LINK = "active.env"
+PRESET_MAX_BYTES = 16 * 1024
+PRESET_MAX_COUNT = 64
+PRESET_LIST_MAX = 256 * 1024
+# Hermes needs a 64K window (D-04); a preset below it cannot serve the agent.
+MIN_CTX = 65536
+THINKING_MODES = ("toggle", "always", "none")
 USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
 UNIT_RE = re.compile(r"[A-Za-z0-9_.@-]{1,128}")
 BIN_RE = re.compile(r"(?:/[A-Za-z0-9_.+-]+){1,16}")
@@ -442,6 +464,190 @@ def agent_cron_action(action: str, job_id: str, env: dict[str, str] | None = Non
     return {"job_id": job_id, "action": action, "started": action == "run"}
 
 
+# --- llama model presets ----------------------------------------------------------------
+
+
+def llama_preset_dir(env: dict[str, str] | None = None) -> str:
+    env = os.environ if env is None else env
+    cfg = settings(env)
+    path = env.get("LLAMA_PRESET_DIR") or f"/home/{cfg['llama_user']}/.config/delve/llama"
+    if not BIN_RE.fullmatch(path) or "/../" in path + "/" or "/./" in path + "/":
+        raise HelperError("failed", "LLAMA_PRESET_DIR is not an absolute path")
+    return path
+
+
+def parse_env_file(text: str) -> dict[str, str]:
+    """A systemd EnvironmentFile, as far as presets use it: KEY=VALUE lines, `#`/`;`
+    comments, one pair of matching quotes around the value removed."""
+    out: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line[0] in "#;" or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        out[key] = value
+    return out
+
+
+def _one_line(value: str | None, limit: int) -> str | None:
+    text = " ".join((value or "").split())
+    return text[:limit] or None
+
+
+def preset_row(name: str, env: dict[str, str], size_of: Callable[[str], int | None]) -> dict[str, Any]:
+    """One preset -> what the backend shows. Only the model's file name leaves, never its
+    path. `size_of(path)` is the file size or None when it is not a readable file."""
+    model = env.get("LLAMA_ARG_MODEL") or ""
+    mmproj = env.get("LLAMA_ARG_MMPROJ") or ""
+    ctx = _int(env.get("LLAMA_ARG_CTX_SIZE"))
+    size = size_of(model) if model.startswith("/") else None
+    thinking = (env.get("DELVE_THINKING") or "toggle").lower()
+    reason = None
+    if not model.startswith("/"):
+        reason = "no_model"
+    elif size is None:
+        reason = "model_missing"
+    elif mmproj and (not mmproj.startswith("/") or size_of(mmproj) is None):
+        reason = "mmproj_missing"
+    elif ctx is None or ctx <= 0:
+        reason = "no_context"
+    elif ctx < MIN_CTX:
+        reason = "context_below_64k"
+    return {
+        "name": name,
+        "file": os.path.basename(model) or None,
+        "label": _one_line(env.get("DELVE_LABEL"), 60),
+        "note": _one_line(env.get("DELVE_NOTE"), 80),
+        "ctx": ctx if ctx and ctx > 0 else None,
+        "vision": bool(mmproj) and reason != "mmproj_missing",
+        "thinking": thinking if thinking in THINKING_MODES else "toggle",
+        "size_bytes": size,
+        "usable": reason is None,
+        "reason": reason,
+    }
+
+
+def _file_size(path: str) -> int | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return st.st_size if os.path.isfile(path) else None
+
+
+def scan_presets(directory: str) -> dict[str, Any]:
+    """Runs as the directory's owner (`--presets <dir>`): every `<preset>.env` and the
+    preset `active.env` points to (None when it is missing or points elsewhere)."""
+    try:
+        names = sorted(os.listdir(directory))
+    except FileNotFoundError:
+        return {"active": None, "models": []}
+    models = []
+    for entry in names:
+        name = entry[: -len(PRESET_SUFFIX)]
+        if not entry.endswith(PRESET_SUFFIX) or entry == ACTIVE_LINK or not PRESET_RE.fullmatch(name):
+            continue
+        path = os.path.join(directory, entry)
+        if os.path.islink(path) or not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                text = f.read(PRESET_MAX_BYTES)
+        except OSError:
+            continue
+        models.append(preset_row(name, parse_env_file(text), _file_size))
+        if len(models) >= PRESET_MAX_COUNT:
+            break
+    active = None
+    link = os.path.join(directory, ACTIVE_LINK)
+    if os.path.islink(link):
+        target = os.readlink(link)
+        name = os.path.basename(target)[: -len(PRESET_SUFFIX)]
+        if (
+            os.path.basename(target).endswith(PRESET_SUFFIX)
+            and os.path.dirname(target) in ("", directory)
+            and any(m["name"] == name for m in models)
+        ):
+            active = name
+    return {"active": active, "models": models}
+
+
+PRESET_FIELDS = ("name", "file", "label", "note", "ctx", "vision", "thinking", "size_bytes",
+                 "usable", "reason")  # fmt: skip
+
+
+def parse_presets(text: str) -> dict[str, Any]:
+    """The scan's answer, taken as data from another user: shape-checked, never trusted."""
+    try:
+        data = json.loads(text)
+        rows = data["models"]
+        active = data["active"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise HelperError("failed", "presets: unexpected content") from exc
+    if not isinstance(rows, list):
+        raise HelperError("failed", "presets: models is not a list")
+    models = []
+    for row in rows[:PRESET_MAX_COUNT]:
+        if not isinstance(row, dict) or not isinstance(row.get("name"), str) \
+                or not PRESET_RE.fullmatch(row["name"]):
+            continue
+        out = {k: row.get(k) for k in PRESET_FIELDS}
+        out["usable"] = row.get("usable") is True
+        out["vision"] = row.get("vision") is True
+        for k in ("ctx", "size_bytes"):
+            if not isinstance(out[k], int) or isinstance(out[k], bool):
+                out[k] = None
+        for k, limit in (("file", 160), ("label", 60), ("note", 80), ("reason", 40)):
+            out[k] = str(out[k])[:limit] if out[k] else None
+        if out["thinking"] not in THINKING_MODES:
+            out["thinking"] = "toggle"
+        models.append(out)
+    if not isinstance(active, str) or not any(m["name"] == active for m in models):
+        active = None
+    return {"active": active, "models": models}
+
+
+def _in_llama_manager(env: dict[str, str] | None, argv: Sequence[str]) -> list[str]:
+    cfg = settings(env)
+    head = [SYSTEMD_RUN, "--user", "-M", f"{cfg['llama_user']}@"]
+    return head + ["--pipe", "--wait", "--quiet", "--collect", "--"] + list(argv)
+
+
+def llama_models(env: dict[str, str] | None = None) -> dict[str, Any]:
+    directory = llama_preset_dir(env)
+    argv = _in_llama_manager(env, [PYTHON, "-I", SELF, "--presets", directory])
+    p = RUN(argv, AGENT_TIMEOUT_S)
+    if p.returncode != 0:
+        raise HelperError("failed", f"presets: {_first_line(p.stderr) or f'exit {p.returncode}'}")
+    if len(p.stdout) > PRESET_LIST_MAX:
+        raise HelperError("failed", "presets: too large")
+    return parse_presets(p.stdout)
+
+
+def llama_select(name: str, env: dict[str, str] | None = None) -> dict[str, Any]:
+    """Point `active.env` at a usable preset. The unit is not touched: a running server keeps
+    its model until the backend restarts it."""
+    if not PRESET_RE.fullmatch(name):
+        raise HelperError("bad_request", "invalid preset name")
+    listing = llama_models(env)
+    row = next((m for m in listing["models"] if m["name"] == name), None)
+    if row is None:
+        raise HelperError("unknown_model", f"no preset {name}")
+    if not row["usable"]:
+        raise HelperError("model_not_usable", f"preset {name}: {row['reason'] or 'not usable'}")
+    if listing["active"] != name:
+        link = f"{llama_preset_dir(env)}/{ACTIVE_LINK}"
+        p = RUN(_in_llama_manager(env, [LN, "-sfn", "--", name + PRESET_SUFFIX, link]), AGENT_TIMEOUT_S)
+        if p.returncode != 0:
+            raise HelperError("failed", f"select: {_first_line(p.stderr) or f'exit {p.returncode}'}")
+    return {"active": name, "previous": listing["active"], "model": row}
+
+
 # --- dispatch -----------------------------------------------------------------------
 
 
@@ -456,6 +662,10 @@ def handle(verb: str, env: dict[str, str] | None = None, arg: str | None = None)
         return agent_cron_list(env)
     if verb in ARG_VERBS:
         return agent_cron_action(verb.rsplit(".", 1)[1], arg or "", env)
+    if verb == "llama.models":
+        return llama_models(env)
+    if verb == "llama.select":
+        return llama_select(arg or "", env)
     cfg = settings(env)
     if verb == "llama.status":
         return _show(cfg["llama_user"], cfg["llama_unit"])
@@ -480,8 +690,15 @@ VERBS = (
     "agent.cron.pause",
     "agent.cron.resume",
     "agent.cron.run",
+    "llama.models",
+    "llama.select",
 )
 ARG_VERBS = ("agent.cron.pause", "agent.cron.resume", "agent.cron.run")
+# verb -> (what its one argument must look like, how the error names it)
+ARG_RULES = {
+    **{verb: (JOB_ID_RE, "job id") for verb in ARG_VERBS},
+    "llama.select": (PRESET_RE, "preset"),
+}
 
 
 def parse_request(raw: bytes) -> tuple[str, str | None]:
@@ -496,10 +713,11 @@ def parse_request(raw: bytes) -> tuple[str, str | None]:
     verb = req["verb"]
     if verb not in VERBS:
         raise HelperError("unknown_verb", "unknown verb")
-    if verb in ARG_VERBS:
+    if verb in ARG_RULES:
+        pattern, what = ARG_RULES[verb]
         if set(req) != {"verb", "arg"} or not isinstance(req["arg"], str) \
-                or not JOB_ID_RE.fullmatch(req["arg"]):
-            raise HelperError("bad_request", 'expected {"verb": "<verb>", "arg": "<job id>"}')
+                or not pattern.fullmatch(req["arg"]):
+            raise HelperError("bad_request", f'expected {{"verb": "<verb>", "arg": "<{what}>"}}')
         return verb, req["arg"]
     if set(req) != {"verb"}:
         raise HelperError("bad_request", 'expected {"verb": "<verb>"}')
@@ -520,7 +738,15 @@ def _timeout(_signum: int, _frame: object) -> None:
     raise TimeoutError
 
 
+def presets_main(directory: str) -> int:
+    """`--presets <dir>`: print the scan as one JSON line (runs as the llama user)."""
+    sys.stdout.write(json.dumps(scan_presets(directory), separators=(",", ":")) + "\n")
+    return 0
+
+
 def main() -> int:
+    if len(sys.argv) == 3 and sys.argv[1] == "--presets":
+        return presets_main(sys.argv[2])
     started = time.monotonic()
     signal.signal(signal.SIGALRM, _timeout)
     signal.alarm(READ_TIMEOUT_S)

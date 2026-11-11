@@ -123,6 +123,8 @@ etc/
   tmpfiles.d/delve-inbox.conf  the attachment inbox: 2750 delve:agent
   delve/helper.env.example  users and units the helper controls
   sudoers.d/agent.template  smartctl whitelist with @DISK_n@ placeholders
+llama/
+  presets/                  one environment file per model for llama-server.service
 hermes/
   SOUL.md                   identity + "Operating rules"
   config.fragments.yaml     curated, secret-free excerpt of the agent's config.yaml
@@ -139,7 +141,7 @@ ops/
   deny-check.sh             run the deny matrix as the agent user
   post-boot-check.sh        full health check after a reboot
 systemd/
-  llama-server.service      user unit for the model server
+  llama-server.service      user unit for the model server (loads the active preset)
   delve-backend.service     system unit for the backend, hardened (loopback only)
   delve-backend.service.d/  drop-ins: fcm.conf (outbound HTTPS), cards.conf (card store),
                             inbox.conf (attachment inbox)
@@ -163,7 +165,12 @@ This is a record of a working setup, not a turnkey installer. Paths use
 1. **NVIDIA driver + CUDA**, then `llama.cpp` built from source at a pinned commit
    (CUDA, `sm_86;sm_89`). Model: Qwen3.8-27B, Unsloth UD-IQ4_XS GGUF.
 2. **`systemd/llama-server.service`** as a user unit of the operator, `loginctl
-   enable-linger`. Check: `curl -s 127.0.0.1:8080/health`.
+   enable-linger`. The model and its settings are a **preset**: copy
+   `llama/presets/qwen38-27b-iq4xs.env.example` to `~/.config/delve/llama/qwen38-27b-iq4xs.env`
+   (fill in the paths) and
+   `ln -sfn qwen38-27b-iq4xs.env ~/.config/delve/llama/active.env`; the unit loads whatever
+   `active.env` points to. One file per model; the Delve app switches between them (D-49).
+   Check: `curl -s 127.0.0.1:8080/health`.
 3. **`agent` user** (no password, member of `systemd-journal`, linger), Hermes Agent
    installed into it (pinned version, "Blank Slate", custom OpenAI-compatible endpoint).
 4. **Configuration:** apply the keys in `hermes/config.fragments.yaml`, then verify:
@@ -215,8 +222,9 @@ This is a record of a working setup, not a turnkey installer. Paths use
     log says `"cards ingested"`.
 16. **Privileged helper:** the backend's unit has no capabilities, no devices and its own
     user namespace, so `sudo` and `nvidia-smi` do not work from it. A root helper with fixed
-    verbs (`llama.status|start|stop`, `hermes.status`, `gpu.status`, `host.status`,
-    `agent.incidents`) answers one JSON line per connection on `/run/delve-helper.sock`
+    verbs (`llama.status|start|stop`, `llama.models`, `llama.select <preset>`,
+    `hermes.status`, `gpu.status`, `host.status`, `agent.incidents`) answers one JSON line
+    per connection on `/run/delve-helper.sock`
     (group `delve`, 0660). `agent.incidents` runs `hermes cron incidents` in the agent's user
     manager (`systemd-run --user -M agent@`, as `systemctl` reaches it), so `HERMES_BIN` in
     `/etc/delve/helper.env` has to name the agent's `hermes` (`command -v hermes` as `agent`):

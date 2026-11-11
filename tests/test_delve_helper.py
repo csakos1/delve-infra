@@ -309,6 +309,211 @@ class Incidents(Base):
                 self.assertIn("HERMES_BIN", r["message"])
 
 
+PRESET_DIR = "/home/operator/.config/delve/llama"
+MODELS_ARGV = (
+    "/usr/bin/systemd-run", "--user", "-M", "operator@", "--pipe", "--wait", "--quiet",
+    "--collect", "--", "/usr/bin/python3", "-I", "/usr/local/lib/delve/delve-helper",
+    "--presets", PRESET_DIR,
+)
+
+
+def select_argv(name: str, directory: str = PRESET_DIR) -> tuple[str, ...]:
+    return MODELS_ARGV[:9] + ("/usr/bin/ln", "-sfn", "--", f"{name}.env", f"{directory}/active.env")
+
+
+def scan_json(active: str | None = "qwen-a") -> str:
+    row = {"file": "Qwen3.8-27B-UD-IQ4_XS.gguf", "label": None, "note": None, "ctx": 98304,
+           "vision": True, "thinking": "toggle", "size_bytes": 14252845984, "usable": True,
+           "reason": None}
+    return json.dumps({"active": active, "models": [
+        dict(row, name="qwen-a"),
+        dict(row, name="qwen-b", ctx=65536, label="Qwen 64K"),
+        dict(row, name="small", ctx=32768, usable=False, reason="context_below_64k"),
+    ]})
+
+
+class Presets(Base):
+    """`llama.models`, `llama.select` and the scan the llama user runs (`--presets`)."""
+
+    def test_models(self) -> None:
+        fake = self.use({MODELS_ARGV: (0, scan_json(), "")})
+        r = self.ask('{"verb": "llama.models"}')
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["data"]["active"], "qwen-a")
+        self.assertEqual([m["name"] for m in r["data"]["models"]], ["qwen-a", "qwen-b", "small"])
+        self.assertEqual(r["data"]["models"][2]["reason"], "context_below_64k")
+        self.assertEqual(len(fake.calls), 1)
+
+    def test_models_output_is_not_trusted(self) -> None:
+        rows = [
+            {"name": "../x", "usable": True},
+            {"name": "ok", "usable": "yes", "vision": 1, "ctx": "big", "size_bytes": True,
+             "thinking": "sometimes", "label": "L" * 200, "file": "f.gguf", "extra": "dropped"},
+            "junk",
+        ]
+        self.use({MODELS_ARGV: (0, json.dumps({"active": "gone", "models": rows}), "")})
+        d = self.ask('{"verb": "llama.models"}')["data"]
+        self.assertIsNone(d["active"])
+        self.assertEqual(len(d["models"]), 1)
+        m = d["models"][0]
+        self.assertEqual((m["usable"], m["vision"], m["ctx"], m["size_bytes"], m["thinking"]),
+                         (False, False, None, None, "toggle"))
+        self.assertEqual(len(m["label"]), 60)
+        self.assertNotIn("extra", m)
+
+    def test_models_failures(self) -> None:
+        self.use({MODELS_ARGV: (1, "", "Failed to connect to bus: No medium found\n")})
+        r = self.ask('{"verb": "llama.models"}')
+        self.assertEqual(r["error"], "failed")
+        self.assertIn("No medium found", r["message"])
+        self.use({MODELS_ARGV: (0, "not json", "")})
+        self.assertEqual(self.ask('{"verb": "llama.models"}')["error"], "failed")
+
+    def test_preset_dir_setting(self) -> None:
+        argv = MODELS_ARGV[:-1] + ("/srv/llama/presets",)
+        self.use({argv: (0, scan_json(None), "")})
+        out, _ = helper.respond(b'{"verb": "llama.models"}', dict(ENV, LLAMA_PRESET_DIR="/srv/llama/presets"))
+        self.assertTrue(out["ok"], out)
+        out, _ = helper.respond(b'{"verb": "llama.models"}', dict(ENV, LLAMA_PRESET_DIR="/srv/../etc"))
+        self.assertEqual(out["error"], "failed")
+
+    def test_select(self) -> None:
+        fake = self.use({MODELS_ARGV: (0, scan_json(), ""), select_argv("qwen-b"): (0, "", "")})
+        r = self.ask('{"verb": "llama.select", "arg": "qwen-b"}')
+        self.assertTrue(r["ok"], r)
+        self.assertEqual((r["data"]["active"], r["data"]["previous"]), ("qwen-b", "qwen-a"))
+        self.assertEqual(r["data"]["model"]["ctx"], 65536)
+        # the listing first, then the link; the unit is never touched
+        self.assertEqual([c[0][9] for c in fake.calls], ["/usr/bin/python3", "/usr/bin/ln"])
+
+    def test_select_active_is_a_no_op(self) -> None:
+        fake = self.use({MODELS_ARGV: (0, scan_json(), "")})
+        r = self.ask('{"verb": "llama.select", "arg": "qwen-a"}')
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(len(fake.calls), 1)
+
+    def test_select_refused(self) -> None:
+        fake = self.use({MODELS_ARGV: (0, scan_json(), "")})
+        r = self.ask('{"verb": "llama.select", "arg": "nope"}')
+        self.assertEqual(r["error"], "unknown_model")
+        r = self.ask('{"verb": "llama.select", "arg": "small"}')
+        self.assertEqual(r["error"], "model_not_usable")
+        self.assertIn("context_below_64k", r["message"])
+        self.assertEqual(len(fake.calls), 2)  # two listings, no link
+
+    def test_select_bad_names_run_nothing(self) -> None:
+        fake = self.use({})
+        for arg in ("", "A", "../x", "a/b", "a b", "-x", "x" * 41, "a;id", "active.env/.."):
+            with self.subTest(arg=arg):
+                r = self.ask(json.dumps({"verb": "llama.select", "arg": arg}))
+                self.assertEqual(r["error"], "bad_request")
+        for raw in ('{"verb": "llama.select"}', '{"verb": "llama.select", "arg": 1}',
+                    '{"verb": "llama.models", "arg": "x"}'):
+            self.assertEqual(self.ask(raw)["error"], "bad_request")
+        self.assertEqual(fake.calls, [])
+
+    def test_select_link_failure(self) -> None:
+        self.use({MODELS_ARGV: (0, scan_json(), ""),
+                  select_argv("qwen-b"): (1, "", "/usr/bin/ln: failed to create symbolic link\n")})
+        r = self.ask('{"verb": "llama.select", "arg": "qwen-b"}')
+        self.assertEqual(r["error"], "failed")
+
+    def test_env_file_parsing(self) -> None:
+        env = helper.parse_env_file(
+            "# comment\n; other\n\nLLAMA_ARG_MODEL=/m/a.gguf\n LLAMA_ARG_CTX_SIZE = 98304 \n"
+            'DELVE_LABEL="Qwen  Q6"\nDELVE_NOTE=\'after the 3060\'\nLLAMA_EXTRA_ARGS=\n'
+            "bad line\n1X=2\nLLAMA_ARG_TENSOR_SPLIT=38,26\n"
+        )
+        self.assertEqual(env, {
+            "LLAMA_ARG_MODEL": "/m/a.gguf", "LLAMA_ARG_CTX_SIZE": "98304",
+            "DELVE_LABEL": "Qwen  Q6", "DELVE_NOTE": "after the 3060", "LLAMA_EXTRA_ARGS": "",
+            "LLAMA_ARG_TENSOR_SPLIT": "38,26",
+        })
+
+    def test_preset_rows(self) -> None:
+        sizes = {"/m/a.gguf": 14_000_000_000, "/m/mmproj.gguf": 900_000_000}
+        base = {"LLAMA_ARG_MODEL": "/m/a.gguf", "LLAMA_ARG_CTX_SIZE": "98304"}
+        cases = [
+            (base, True, None, False),
+            (dict(base, LLAMA_ARG_MMPROJ="/m/mmproj.gguf"), True, None, True),
+            (dict(base, LLAMA_ARG_MMPROJ="/m/gone.gguf"), False, "mmproj_missing", False),
+            (dict(base, LLAMA_ARG_CTX_SIZE="65536"), True, None, False),
+            (dict(base, LLAMA_ARG_CTX_SIZE="65535"), False, "context_below_64k", False),
+            (dict(base, LLAMA_ARG_CTX_SIZE="lots"), False, "no_context", False),
+            ({"LLAMA_ARG_MODEL": "/m/a.gguf"}, False, "no_context", False),
+            (dict(base, LLAMA_ARG_MODEL="/m/gone.gguf"), False, "model_missing", False),
+            (dict(base, LLAMA_ARG_MODEL="a.gguf"), False, "no_model", False),
+            ({}, False, "no_model", False),
+        ]
+        for env, usable, reason, vision in cases:
+            with self.subTest(env=env):
+                row = helper.preset_row("p", env, sizes.get)
+                self.assertEqual((row["usable"], row["reason"], row["vision"]), (usable, reason, vision))
+        row = helper.preset_row("p", dict(base, DELVE_THINKING="Always", DELVE_LABEL=" Qwen   Q6 ",
+                                          DELVE_NOTE="x" * 200), sizes.get)
+        self.assertEqual((row["thinking"], row["label"], len(row["note"])), ("always", "Qwen Q6", 80))
+        self.assertEqual((row["file"], row["size_bytes"], row["ctx"]), ("a.gguf", 14_000_000_000, 98304))
+        self.assertEqual(helper.preset_row("p", dict(base, DELVE_THINKING="maybe"), sizes.get)["thinking"], "toggle")
+        self.assertNotIn("/m/", json.dumps(row))  # the path stays on the host
+
+    def test_scan_directory(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            model = os.path.join(d, "Model-Q4_K_M.gguf")
+            with open(model, "wb") as f:
+                f.write(b"x" * 10)
+
+            def preset(name: str, ctx: int, path: str = model) -> None:
+                with open(os.path.join(d, name), "w", encoding="utf-8") as f:
+                    f.write(f"LLAMA_ARG_MODEL={path}\nLLAMA_ARG_CTX_SIZE={ctx}\n")
+
+            preset("b.env", 65536)
+            preset("a.env", 98304)
+            preset("gone.env", 98304, os.path.join(d, "missing.gguf"))
+            preset("Upper.env", 98304)       # not a preset name
+            preset("notes.txt", 98304)       # not a preset file
+            os.symlink("a.env", os.path.join(d, "alias.env"))  # a link is not a preset
+            self.assertIsNone(helper.scan_presets(d)["active"])
+            os.symlink("b.env", os.path.join(d, "active.env"))
+            out = helper.scan_presets(d)
+            self.assertEqual([m["name"] for m in out["models"]], ["a", "b", "gone"])
+            self.assertEqual(out["active"], "b")
+            self.assertEqual(out["models"][0]["size_bytes"], 10)
+            self.assertEqual(out["models"][2]["reason"], "model_missing")
+            os.remove(os.path.join(d, "active.env"))
+            os.symlink("/etc/passwd", os.path.join(d, "active.env"))
+            self.assertIsNone(helper.scan_presets(d)["active"])
+            # what the scan prints is what llama.models accepts
+            self.assertEqual(helper.parse_presets(json.dumps(out))["models"], out["models"])
+        self.assertEqual(helper.scan_presets(os.path.join(d, "nowhere")), {"active": None, "models": []})
+
+    def test_scan_mode_of_the_script(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            p = subprocess.run(
+                [sys.executable, "-I", os.path.join(ROOT, "bin", "delve-helper"), "--presets", d],
+                capture_output=True, text=True, timeout=30, check=False, stdin=subprocess.DEVNULL,
+            )
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(json.loads(p.stdout), {"active": None, "models": []})
+
+    def test_shipped_preset_is_usable(self) -> None:
+        with open(os.path.join(ROOT, "llama", "presets", "qwen38-27b-iq4xs.env.example"), encoding="utf-8") as f:
+            env = helper.parse_env_file(f.read())
+        row = helper.preset_row("qwen38-27b-iq4xs", env, lambda _path: 1)
+        self.assertEqual((row["usable"], row["ctx"], row["vision"], row["thinking"]),
+                         (True, 98304, True, "toggle"))
+        self.assertIn("LLAMA_EXTRA_ARGS", env)
+        self.assertTrue(helper.PRESET_RE.fullmatch("qwen38-27b-iq4xs"))
+        with open(os.path.join(ROOT, "systemd", "llama-server.service"), encoding="utf-8") as f:
+            unit = f.read()
+        for needed in ("EnvironmentFile=%h/.config/delve/llama/active.env", "$LLAMA_EXTRA_ARGS",
+                       "--host 127.0.0.1", "--port 8080", "-np 1"):
+            self.assertIn(needed, unit)
+
+
 CRON_LIST_ARGV = (
     "/usr/bin/systemd-run", "--user", "-M", "agent@", "--pipe", "--wait", "--quiet",
     "--collect", "--", "/usr/bin/cat", "--", "/home/agent/.hermes/cron/jobs.json",
