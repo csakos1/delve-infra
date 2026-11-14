@@ -23,7 +23,7 @@ model:
   supports_vision: true
 
 # Legacy provider format (hermes doctor suggests migrating to `providers:`).
-# The context-length pin must match llama-server's -c 65536 with -np 1.
+# The context-length pin (131072) must not exceed the -c of any agent preset; llama-server runs with -np 1.
 custom_providers:
   - name: llama-qwen38
     base_url: http://127.0.0.1:8080/v1
@@ -32,7 +32,7 @@ custom_providers:
     api_mode: chat_completions
     models:
       "/home/<operator>/models/qwen38/Qwen3.8-27B-UD-IQ4_XS.gguf":
-        context_length: 65536
+        context_length: 131072
   # Thinking variant, selected per run by delve-backend (run body: provider + model).
   # The distinct base_url is required: Hermes normalizes custom:<name> to "custom" and
   # resolves extra_body by base_url + model, so an identical URL always matches the first entry.
@@ -43,7 +43,7 @@ custom_providers:
     api_mode: chat_completions
     models:
       "/home/<operator>/models/qwen38/Qwen3.8-27B-UD-IQ4_XS.gguf":
-        context_length: 65536
+        context_length: 131072
     extra_body:
       chat_template_kwargs:
         enable_thinking: true
