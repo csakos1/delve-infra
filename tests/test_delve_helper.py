@@ -488,6 +488,56 @@ class Presets(Base):
             self.assertEqual(helper.parse_presets(json.dumps(out))["models"], out["models"])
         self.assertEqual(helper.scan_presets(os.path.join(d, "nowhere")), {"active": None, "models": []})
 
+    def test_min_ctx_setting(self) -> None:
+        # unset or 65536: the scan command is unchanged; above it, the bar is passed on
+        fake = self.use({MODELS_ARGV: (0, scan_json(), ""), MODELS_ARGV + ("131072",): (0, scan_json(), "")})
+        for value, argv in (("", MODELS_ARGV), ("65536", MODELS_ARGV), ("131072", MODELS_ARGV + ("131072",))):
+            with self.subTest(value=value):
+                r, _ = helper.respond(b'{"verb": "llama.models"}', dict(ENV, LLAMA_MIN_CTX=value))
+                self.assertTrue(r["ok"], r)
+                self.assertEqual(tuple(fake.calls[-1][0]), argv)
+        for value in ("65535", "0", "128k", "-131072", "131072.0", "99999999", "１３１０７２"):
+            with self.subTest(value=value):
+                r, _ = helper.respond(b'{"verb": "llama.models"}', dict(ENV, LLAMA_MIN_CTX=value))
+                self.assertEqual(r["error"], "failed")
+                self.assertIn("LLAMA_MIN_CTX", r["message"])
+        self.assertEqual(helper.llama_min_ctx({}), 65536)
+        self.assertEqual(helper.llama_min_ctx({"LLAMA_MIN_CTX": " 131072 "}), 131072)
+
+    def test_min_ctx_raises_the_bar(self) -> None:
+        sizes = {"/m/a.gguf": 1}
+        base = {"LLAMA_ARG_MODEL": "/m/a.gguf"}
+        for ctx, bar, usable in ((98304, 65536, True), (98304, 131072, False), (131072, 131072, True),
+                                 (163840, 131072, True), (65536, 1, True), (65535, 1, False)):
+            with self.subTest(ctx=ctx, bar=bar):
+                row = helper.preset_row("p", dict(base, LLAMA_ARG_CTX_SIZE=str(ctx)), sizes.get, bar)
+                self.assertEqual((row["usable"], row["reason"]),
+                                 (usable, None if usable else "context_below_64k"))
+
+    def test_scan_mode_takes_the_bar(self) -> None:
+        import tempfile
+
+        script = os.path.join(ROOT, "bin", "delve-helper")
+        with tempfile.TemporaryDirectory() as d:
+            model = os.path.join(d, "Model-Q4_K_M.gguf")
+            with open(model, "wb") as f:
+                f.write(b"x")
+            with open(os.path.join(d, "a.env"), "w", encoding="utf-8") as f:
+                f.write(f"LLAMA_ARG_MODEL={model}\nLLAMA_ARG_CTX_SIZE=98304\n")
+
+            def scan(*extra: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run([sys.executable, "-I", script, "--presets", d, *extra],
+                                      capture_output=True, text=True, timeout=30, check=False,
+                                      stdin=subprocess.DEVNULL)
+
+            self.assertTrue(json.loads(scan().stdout)["models"][0]["usable"])
+            row = json.loads(scan("131072").stdout)["models"][0]
+            self.assertEqual((row["usable"], row["reason"]), (False, "context_below_64k"))
+            for bad in ("lots", "1", "99999999"):
+                with self.subTest(bad=bad):
+                    p = scan(bad)
+                    self.assertEqual((p.returncode, p.stdout), (2, ""))
+
     def test_scan_mode_of_the_script(self) -> None:
         import tempfile
 

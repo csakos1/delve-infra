@@ -25,13 +25,14 @@ Model presets: one systemd environment file per model in the llama user's
 `~/.config/delve/llama/<preset>.env` (see `llama/presets/`); `active.env` there is a
 symlink to the one `llama-server.service` loads. `llama.models` lists them, `llama.select`
 moves the symlink and nothing else: the backend stops and starts the unit around it. The
-directory is read as its owner, by running this file there as `--presets <dir>`.
+directory is read as its owner, by running this file there as `--presets <dir> [<min ctx>]`.
 
 Settings come from the environment (`/etc/delve/helper.env`, see
 `etc/delve/helper.env.example`): LLAMA_USER, LLAMA_UNIT, AGENT_USER, HERMES_UNIT,
 HERMES_BIN (for the agent.* verbs), AGENT_HERMES_HOME (for agent.cron.list; default
 /home/<AGENT_USER>/.hermes), LLAMA_PRESET_DIR (default
-/home/<LLAMA_USER>/.config/delve/llama).
+/home/<LLAMA_USER>/.config/delve/llama), LLAMA_MIN_CTX (the context a preset needs to be
+usable; default and lower bound 65536).
 Only the standard library is used; no shell is involved.
 """
 
@@ -77,8 +78,10 @@ ACTIVE_LINK = "active.env"
 PRESET_MAX_BYTES = 16 * 1024
 PRESET_MAX_COUNT = 64
 PRESET_LIST_MAX = 256 * 1024
-# Hermes needs a 64K window (D-04); a preset below it cannot serve the agent.
+# Hermes needs a 64K window (D-04); a preset below it cannot serve the agent. LLAMA_MIN_CTX
+# raises the bar to the window Hermes is configured with (D-51), never lowers it.
 MIN_CTX = 65536
+MAX_MIN_CTX = 4 * 1024 * 1024
 THINKING_MODES = ("toggle", "always", "none")
 USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
 UNIT_RE = re.compile(r"[A-Za-z0-9_.@-]{1,128}")
@@ -476,6 +479,16 @@ def llama_preset_dir(env: dict[str, str] | None = None) -> str:
     return path
 
 
+def llama_min_ctx(env: dict[str, str] | None = None) -> int:
+    env = os.environ if env is None else env
+    raw = (env.get("LLAMA_MIN_CTX") or "").strip()
+    if not raw:
+        return MIN_CTX
+    if not raw.isascii() or not raw.isdigit() or not MIN_CTX <= int(raw) <= MAX_MIN_CTX:
+        raise HelperError("failed", f"LLAMA_MIN_CTX is not a number from {MIN_CTX} to {MAX_MIN_CTX}")
+    return int(raw)
+
+
 def parse_env_file(text: str) -> dict[str, str]:
     """A systemd EnvironmentFile, as far as presets use it: KEY=VALUE lines, `#`/`;`
     comments, one pair of matching quotes around the value removed."""
@@ -499,9 +512,12 @@ def _one_line(value: str | None, limit: int) -> str | None:
     return text[:limit] or None
 
 
-def preset_row(name: str, env: dict[str, str], size_of: Callable[[str], int | None]) -> dict[str, Any]:
+def preset_row(
+    name: str, env: dict[str, str], size_of: Callable[[str], int | None], min_ctx: int = MIN_CTX
+) -> dict[str, Any]:
     """One preset -> what the backend shows. Only the model's file name leaves, never its
-    path. `size_of(path)` is the file size or None when it is not a readable file."""
+    path. `size_of(path)` is the file size or None when it is not a readable file. The
+    reason keeps its name when `min_ctx` is above 64K: the backend and the app know it."""
     model = env.get("LLAMA_ARG_MODEL") or ""
     mmproj = env.get("LLAMA_ARG_MMPROJ") or ""
     ctx = _int(env.get("LLAMA_ARG_CTX_SIZE"))
@@ -516,7 +532,7 @@ def preset_row(name: str, env: dict[str, str], size_of: Callable[[str], int | No
         reason = "mmproj_missing"
     elif ctx is None or ctx <= 0:
         reason = "no_context"
-    elif ctx < MIN_CTX:
+    elif ctx < max(min_ctx, MIN_CTX):
         reason = "context_below_64k"
     return {
         "name": name,
@@ -540,7 +556,7 @@ def _file_size(path: str) -> int | None:
     return st.st_size if os.path.isfile(path) else None
 
 
-def scan_presets(directory: str) -> dict[str, Any]:
+def scan_presets(directory: str, min_ctx: int = MIN_CTX) -> dict[str, Any]:
     """Runs as the directory's owner (`--presets <dir>`): every `<preset>.env` and the
     preset `active.env` points to (None when it is missing or points elsewhere)."""
     try:
@@ -560,7 +576,7 @@ def scan_presets(directory: str) -> dict[str, Any]:
                 text = f.read(PRESET_MAX_BYTES)
         except OSError:
             continue
-        models.append(preset_row(name, parse_env_file(text), _file_size))
+        models.append(preset_row(name, parse_env_file(text), _file_size, min_ctx))
         if len(models) >= PRESET_MAX_COUNT:
             break
     active = None
@@ -620,7 +636,11 @@ def _in_llama_manager(env: dict[str, str] | None, argv: Sequence[str]) -> list[s
 
 def llama_models(env: dict[str, str] | None = None) -> dict[str, Any]:
     directory = llama_preset_dir(env)
-    argv = _in_llama_manager(env, [PYTHON, "-I", SELF, "--presets", directory])
+    min_ctx = llama_min_ctx(env)
+    scan = [PYTHON, "-I", SELF, "--presets", directory]
+    if min_ctx != MIN_CTX:
+        scan.append(str(min_ctx))
+    argv = _in_llama_manager(env, scan)
     p = RUN(argv, AGENT_TIMEOUT_S)
     if p.returncode != 0:
         raise HelperError("failed", f"presets: {_first_line(p.stderr) or f'exit {p.returncode}'}")
@@ -738,15 +758,23 @@ def _timeout(_signum: int, _frame: object) -> None:
     raise TimeoutError
 
 
-def presets_main(directory: str) -> int:
-    """`--presets <dir>`: print the scan as one JSON line (runs as the llama user)."""
-    sys.stdout.write(json.dumps(scan_presets(directory), separators=(",", ":")) + "\n")
+def presets_main(directory: str, min_ctx: str | None = None) -> int:
+    """`--presets <dir> [<min ctx>]`: print the scan as one JSON line (runs as the llama
+    user). A bar that is not a number is an error, not a reason to fall back to 64K."""
+    if min_ctx is None:
+        bar = MIN_CTX
+    elif min_ctx.isascii() and min_ctx.isdigit() and MIN_CTX <= int(min_ctx) <= MAX_MIN_CTX:
+        bar = int(min_ctx)
+    else:
+        print("presets: invalid minimum context", file=sys.stderr)
+        return 2
+    sys.stdout.write(json.dumps(scan_presets(directory, bar), separators=(",", ":")) + "\n")
     return 0
 
 
 def main() -> int:
-    if len(sys.argv) == 3 and sys.argv[1] == "--presets":
-        return presets_main(sys.argv[2])
+    if len(sys.argv) in (3, 4) and sys.argv[1] == "--presets":
+        return presets_main(*sys.argv[2:])
     started = time.monotonic()
     signal.signal(signal.SIGALRM, _timeout)
     signal.alarm(READ_TIMEOUT_S)

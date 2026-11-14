@@ -295,6 +295,14 @@ restart anything: the backend stops and starts the unit around it with the exist
 holds its queue meanwhile, and goes back to the previous preset when the new one does not
 come up. The backend can only choose among files the operator wrote.
 
+**D-51 The context a preset needs is a setting (`LLAMA_MIN_CTX`).** With a third GPU the
+presets hold 128K and more, and Hermes was given a 131072 window (`context_length`). A
+preset between 64K and that window would be listed as usable and then fail in the middle
+of a chat, when a prompt outgrows the server's window. `/etc/delve/helper.env` therefore
+names the bar; the helper passes it to the scan (`--presets <dir> <min ctx>`). It can only
+raise the 64K of D-04, and the reason stays `context_below_64k`: the backend and the app
+know that name. Whoever changes Hermes's `context_length` changes `LLAMA_MIN_CTX` with it.
+
 ## Rejected or deferred
 
 | Option | Outcome | Reason |
