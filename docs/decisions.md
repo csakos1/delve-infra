@@ -353,6 +353,32 @@ for the content: an icon is the app's, the same for each of its notifications - 
 files say which apps posted, nothing of what, and are gone at logout. A missing icon is
 never a reason not to show a notification.
 
+## Personal profile (Delve P)
+
+**D-56 The profile lives outside the repositories; the backend writes it, the agent only
+reads it.** What the agent knows about its user is a directory, `/var/lib/delve-persona`
+(2750 `delve:agent`, like the inbox): `profile.md`, a short core that is part of every
+run's instructions, and `topics/<name>.md`, detail the agent opens with `read_file` when a
+question needs it - the instructions carry one line for each file. The app edits both
+through the backend. The agent's user can read the directory and not write it: a model
+that could rewrite what it is told about its user could be talked into doing so by a web
+page. Nothing personal is in a repository, `hermes/SOUL.md` included (it is versioned
+here; it says how the agent behaves, not who it works for); `persona.example/` shows the
+format with an invented person. A section or file goes to the cloud models of the app's
+General chats only when it is marked `general` - the default is that it does not. Measured
+before building (an invented profile of 525 tokens beside a 10 267-token system prompt,
+Qwen3.8 27B Q6): every fact asked for was used, nothing of it appeared in three unrelated
+answers, and the right topic file was read once when - and only when - the answer was in
+it.
+
+**D-57 A conversation keeps the profile it started with.** Hermes puts a run's
+`instructions` at the end of the system prompt, before the conversation. With the same
+text in every run llama-server's prompt cache holds (37 tokens processed for the next
+message, 432 for a new chat); a changed text makes it read the whole conversation again.
+The backend therefore stores the text with the conversation at its first run, and an edit
+applies to the chats started after it. Every agent run gets the profile, scheduled ones
+too: runs with and without it would evict each other's cached prefix (3-4 s each time).
+
 ## Rejected or deferred
 
 | Option | Outcome | Reason |
@@ -376,4 +402,5 @@ never a reason not to show a notification.
 | `llama-server` router mode for switching models | rejected | the `model` field would select the model for every caller (D-49) |
 | KDE Connect for notifications and the clipboard | rejected | a second app on the phone and its own pairing; everything about the machine stays in one app |
 | Backend connecting to a socket of the desktop agent | rejected | the sandbox cannot see the session, the `delve` group would open the helper (D-53) |
+| Hermes' own `memory` toolset as the profile's store | deferred | only the agent would see it (not the General chats) and the 27B would write it unsupervised; kept off, to be looked at again for "remember this" (D-56) |
 | Tailscale SSH for the app's terminal | rejected | any app on the phone's VPN could log in; the SSH library does not do its check mode (D-48) |

@@ -124,6 +124,7 @@ etc/
   ssh/sshd_config.d/        key-only SSH; 30-delve.conf: OpenSSH on 22 and 2222 (the app's terminal)
   sysusers.d/delve.conf     the backend's system user
   tmpfiles.d/delve-inbox.conf  the attachment inbox: 2750 delve:agent
+  tmpfiles.d/delve-persona.conf  the personal profile's directory: 2750 delve:agent
   delve/helper.env.example  users and units the helper controls
   delve/desk.env.example    the desktop agent's token (the operator's ~/.config/delve/desk.env)
   sudoers.d/agent.template  smartctl whitelist with @DISK_n@ placeholders
@@ -144,11 +145,12 @@ ops/
   config-check.py           dump / verify the live config against the fragment
   deny-check.sh             run the deny matrix as the agent user
   post-boot-check.sh        full health check after a reboot
+persona.example/           the format of the personal profile, with an invented person
 systemd/
   llama-server.service      user unit for the model server (loads the active preset)
   delve-backend.service     system unit for the backend, hardened (loopback only)
   delve-backend.service.d/  drop-ins: fcm.conf (outbound HTTPS), cards.conf (card store),
-                            inbox.conf (attachment inbox)
+                            inbox.conf (attachment inbox), persona.conf (personal profile)
   delve-helper.socket, delve-helper@.service   socket-activated helper, one request each
   delve-desk.service        user unit for the desktop agent (graphical session)
   hermes-gateway.override.conf  drop-in for the Hermes-generated gateway unit
@@ -306,7 +308,22 @@ This is a record of a working setup, not a turnkey installer. Paths use
     -n 5` says `started: asking http://127.0.0.1:8700`. The unit belongs to the graphical
     session: it runs while the operator is logged in and has nothing to show otherwise
     (D-52..D-55).
-21. **Reboot without logging in**, connect over SSH, run `ops/post-boot-check.sh`.
+21. **Personal profile (Delve P1):** what the agent is told about the person it works for
+    lives in `/var/lib/delve-persona` - in no repository. The backend writes it (the app
+    edits it there), the agent reads it through its group, like the inbox:
+    ```sh
+    sudo install -m 0644 etc/tmpfiles.d/delve-persona.conf /etc/tmpfiles.d/
+    sudo systemd-tmpfiles --create delve-persona.conf
+    sudo install -m 0644 systemd/delve-backend.service.d/persona.conf /etc/systemd/system/delve-backend.service.d/
+    sudo systemctl daemon-reload && sudo systemctl restart delve-backend
+    sudo stat -c '%n %U:%G %A' /var/lib/delve-persona /var/lib/delve-persona/topics   # delve:agent drwxr-s---
+    ```
+    Start from your own files in the format of `persona.example/` (an invented person):
+    `sudo install -o delve -g agent -m 0640 profile.md /var/lib/delve-persona/` and
+    `sudo install -o delve -g agent -m 0640 topics/*.md /var/lib/delve-persona/topics/`.
+    A chat started after that gets the core in its instructions and the list of topic
+    files; a chat that is already running keeps what it started with (D-56, D-57).
+22. **Reboot without logging in**, connect over SSH, run `ops/post-boot-check.sh`.
 
 ## Tests
 
