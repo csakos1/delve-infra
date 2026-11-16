@@ -115,7 +115,8 @@ bin/
   delve-env                 writes /etc/delve/env from a development env file
   delve-helper              root helper for the backend: fixed verbs over a unix socket
   delve-desk                desktop agent in the operator's session: shows the phone's
-                            notifications (two verbs, asks the backend on the loopback)
+                            notifications with their apps' icons (two verbs, asks the
+                            backend on the loopback)
   render-sudoers            fills etc/sudoers.d/agent.template from site.env, checks disks exist
   wait-llama.sh             ExecStartPre: wait up to 120 s for llama-server /health
 etc/
@@ -297,13 +298,14 @@ This is a record of a working setup, not a turnkey installer. Paths use
     prints the agent's token once; `install -D -m 0600 etc/delve/desk.env.example
     ~/.config/delve/desk.env` and put the token in it; check with
     `(set -a; . ~/.config/delve/desk.env; python3 -I bin/delve-desk --check)` - it names
-    the daemon, asks the backend once and shows a test notification for 3 seconds. Then
+    the daemon, asks the backend once, says where it keeps the apps' icons
+    (`$XDG_RUNTIME_DIR/delve-desk`, D-55) and shows a test notification for 3 seconds. Then
     `install -D -m 0644 systemd/delve-desk.service
     ~/.config/systemd/user/delve-desk.service`, `systemctl --user daemon-reload`,
     `systemctl --user enable --now delve-desk.service`; `journalctl --user -u delve-desk
     -n 5` says `started: asking http://127.0.0.1:8700`. The unit belongs to the graphical
     session: it runs while the operator is logged in and has nothing to show otherwise
-    (D-52..D-54).
+    (D-52..D-55).
 21. **Reboot without logging in**, connect over SSH, run `ops/post-boot-check.sh`.
 
 ## Tests

@@ -18,6 +18,11 @@ Restart=on-failure
 RestartSec=10
 MemoryMax=64M
 TasksMax=16
+# The mirrored apps' icons (D-55): $XDG_RUNTIME_DIR/delve-desk, a tmpfs. Kept over a
+# restart of the agent - a notification still shown points at its icon's file.
+RuntimeDirectory=delve-desk
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
 
 # What a user manager applies without privileges (measured on the host, DA2 fixtures).
 # Not PrivateNetwork: the backend is on the loopback. The session bus is a unix socket.

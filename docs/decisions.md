@@ -338,6 +338,21 @@ them to the database or the log; the agent logs counts. One-time codes arrive wi
 their content (Android hides it from notification listeners) and are shown as "Hidden
 content - check the phone".
 
+**D-55 A mirrored notification shows its app's icon, as a file the agent checked.** The
+phone sends the posting app's icon with a post (a PNG of at most 32 KiB); the backend
+keeps the newest 64 in memory and names each by its hash in `notify.show`. The agent
+fetches a picture it does not have yet (`GET /api/v1/desk/icon/<name>`, the same token),
+accepts it only as a PNG header of at most 512 x 512 whose hash is that name, and keeps
+it in its runtime directory (`$XDG_RUNTIME_DIR/delve-desk`, a tmpfs, the newest 200
+files); the notification daemon gets the path as the notification's icon. This widens
+what D-52 lets a compromised backend do by one thing: it can make the daemon's image
+loader read a PNG of its choosing, where before it could only put text on the screen.
+The check above keeps other formats and oversized pictures away from it; the decoder
+itself is the desktop's (gdk-pixbuf), as for every other app's notification. D-54 stands
+for the content: an icon is the app's, the same for each of its notifications - the kept
+files say which apps posted, nothing of what, and are gone at logout. A missing icon is
+never a reason not to show a notification.
+
 ## Rejected or deferred
 
 | Option | Outcome | Reason |

@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -I
-"""Delve desktop agent: shows the phone's notifications on this desktop (DA2, D-52..D-54).
+"""Delve desktop agent: shows the phone's notifications on this desktop (DA2, D-52..D-55).
 
 A user service in the operator's graphical session (`systemd/delve-desk.service`). The
 backend runs confined as its own user and cannot reach a session bus, so the agent calls
@@ -7,7 +7,7 @@ out: it asks the backend on the loopback for commands (`GET /api/v1/desk/next`, 
 poll, with a token of the role `desk` that opens nothing else) and carries them out with
 the notification daemon. Two verbs, nothing more:
 
-    {"verb": "notify.show", "id", "app", "title", "body", "category", "hidden"}
+    {"verb": "notify.show", "id", "app", "title", "body", "category", "hidden", "icon"}
     {"verb": "notify.close", "id"}
 
 `id` (16 hex characters) names a notification of the phone; the same id again replaces
@@ -17,6 +17,12 @@ are escaped, the notification has no actions. A mirrored notification carries th
 `x-delve-origin=phone`, so whatever watches this desktop's notifications later knows not
 to send it back.
 
+`icon` ("" or 32 hex characters) names the posting app's icon (D-55). The agent fetches
+the picture once from the backend (`GET /api/v1/desk/icon/<name>`), checks that it is a
+small PNG whose hash is that name, and keeps it in its runtime directory
+(`$XDG_RUNTIME_DIR/delve-desk`, a tmpfs: gone at logout); the daemon gets the file's path
+as the notification's icon. No icon is never a reason not to show a notification.
+
     delve-desk            run (the unit does)
     delve-desk --check    the settings, the daemon, one request, a test notification
 
@@ -25,12 +31,14 @@ Settings come from the environment (`~/.config/delve/desk.env`, mode 0600, see
 http://127.0.0.1:8700; only a loopback http address is accepted - the token must not
 leave the machine in the clear).
 
-Nothing of a notification is written anywhere: the log (stderr, the journal) has counts
-and errors. Only the standard library is used.
+Nothing of a notification's content is written anywhere: the log (stderr, the journal)
+has counts and errors; the kept icons say which apps posted, not what. Only the standard
+library is used.
 """
 
 from __future__ import annotations
 
+import hashlib
 import html
 import http.client
 import json
@@ -72,6 +80,13 @@ BODY_MAX = 2000
 CATEGORIES = {"msg": "im.received", "email": "email.arrived", "call": "call.incoming"}
 HIDDEN_BODY = "Hidden content - check the phone"
 ORIGIN_HINT = ("x-delve-origin", "s", "phone")
+
+ICON_RE = re.compile(r"[0-9a-f]{32}")
+ICON_MAX = 32 * 1024  # the backend takes no larger one
+ICON_SIDE_MAX = 512
+ICONS_KEPT = 200
+ICON_TIMEOUT_S = 5
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 CHILD_ENV_KEYS = ("DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR")
 
@@ -126,11 +141,75 @@ def clean(value: Any, limit: int) -> str:
     return out.strip()[:limit]
 
 
+def png_ok(data: bytes) -> bool:
+    """A PNG by its first chunk, of a size an icon has; the picture is not decoded here."""
+    if len(data) > ICON_MAX or len(data) < 33 or not data.startswith(PNG_MAGIC):
+        return False
+    if data[8:16] != b"\x00\x00\x00\rIHDR":
+        return False
+    width, height = int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+    return 1 <= width <= ICON_SIDE_MAX and 1 <= height <= ICON_SIDE_MAX
+
+
+def icon_dir(env: Mapping[str, str]) -> str | None:
+    """Where the icons are kept: the unit's RuntimeDirectory, else the same place by
+    XDG_RUNTIME_DIR; None (no icons) without either."""
+    given = env.get("RUNTIME_DIRECTORY", "").split(":")[0]
+    if not given and env.get("XDG_RUNTIME_DIR"):
+        given = os.path.join(env["XDG_RUNTIME_DIR"], "delve-desk")
+    return given if os.path.isabs(given) else None
+
+
+class Icons:
+    """The apps' icons as files the notification daemon can read, fetched on first use."""
+
+    def __init__(self, directory: str | None, base: str, token: str) -> None:
+        self.directory, self.base, self.token = directory, base, token
+
+    def path(self, name: Any) -> str:
+        """The icon's file, or "" when there is none to show (and why is not an error)."""
+        if self.directory is None or not isinstance(name, str) or not ICON_RE.fullmatch(name):
+            return ""
+        target = os.path.join(self.directory, f"{name}.png")
+        if os.path.isfile(target):
+            return target
+        try:
+            url = f"{self.base}/api/v1/desk/icon/{name}"
+            status, data = FETCH(url, self.token, ICON_TIMEOUT_S)
+        except (OSError, ValueError, http.client.HTTPException):
+            return ""
+        # the name is the picture's hash: what is kept under it is what the phone sent
+        if status != 200 or not png_ok(data) or hashlib.sha256(data).hexdigest()[:32] != name:
+            return ""
+        try:
+            os.makedirs(self.directory, mode=0o700, exist_ok=True)
+            part = f"{target}.part"
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+            with os.fdopen(os.open(part, flags, 0o600), "wb") as f:
+                f.write(data)
+            os.replace(part, target)
+            self._prune()
+        except OSError:
+            return ""
+        return target
+
+    def _prune(self) -> None:
+        assert self.directory is not None
+        kept = []
+        with os.scandir(self.directory) as entries:
+            for entry in entries:
+                if entry.name.endswith(".png") and entry.is_file(follow_symlinks=False):
+                    kept.append((entry.stat(follow_symlinks=False).st_mtime, entry.path))
+        for _, path in sorted(kept)[: max(0, len(kept) - ICONS_KEPT)]:
+            os.unlink(path)
+
+
 class Desk:
     """The notifications this agent put on the desktop: the phone's id -> the daemon's."""
 
-    def __init__(self) -> None:
+    def __init__(self, icons: Icons | None = None) -> None:
         self.shown: OrderedDict[str, int] = OrderedDict()
+        self.icons = icons
 
     def handle(self, command: Any) -> str:
         """Carry out one command; returns the verb done, raises DeskError otherwise."""
@@ -162,7 +241,7 @@ class Desk:
         args = [
             app,  # app_name
             str(self.shown.get(nid, 0)),  # replaces_id
-            "",  # app_icon
+            self.icons.path(command.get("icon")) if self.icons else "",  # app_icon
             title or app,  # summary: plain text by the specification
             html.escape(body, quote=False),  # body: the daemon reads markup here
             "0",  # actions: none
@@ -279,7 +358,7 @@ def serve(
     except DeskError as exc:
         log(f"not started: {exc}")
         return 2
-    desk = Desk()
+    desk = Desk(Icons(icon_dir(env), base, token))
     failures = 0
     log(f"started: asking {base}")
     while rounds is None or rounds > 0:
@@ -315,7 +394,9 @@ def check(env: Mapping[str, str]) -> int:
         print(f"notification daemon: {info}")
         commands = poll(base, token, wait=0)
         print(f"backend: ok ({len(commands)} waiting)")
-        desk = Desk()
+        where = icon_dir(env)
+        print(f"icons: {'kept in ' + where if where else 'off (no runtime directory)'}")
+        desk = Desk(Icons(where, base, token))
         carry_out(desk, commands)
         nid = "0" * 16
         desk.show(nid, {"app": "Delve", "title": "Delve desktop agent", "body": "It works."})
