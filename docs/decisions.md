@@ -303,6 +303,41 @@ names the bar; the helper passes it to the scan (`--presets <dir> <min ctx>`). I
 raise the 64K of D-04, and the reason stays `context_below_64k`: the backend and the app
 know that name. Whoever changes Hermes's `context_length` changes `LLAMA_MIN_CTX` with it.
 
+## Desktop agent (Delve DA2)
+
+**D-52 A desktop agent in the operator's session, with two verbs.** Showing the phone's
+notifications needs the session bus of the logged-in user. The backend runs confined as
+`delve` (no home directories, its own user namespace) and must not get there, and the
+root helper has no business in a graphical session. So a third small program does it:
+`bin/delve-desk`, a user unit of the operator bound to `graphical-session.target`. It
+knows `notify.show` and `notify.close` and nothing else. Every value is checked again in
+the agent and handed to `busctl` as one argument (no shell); text is shown, never
+interpreted: markup characters in the body are escaped, the summary is plain text, the
+notification has no actions, so nothing in it can be clicked into running something. A
+compromised backend could therefore put misleading text on the screen and no more. The
+agent keeps the phone's id -> the daemon's id in memory to replace and close what it
+showed; it does not watch the bus. Mirrored notifications carry the hint
+`x-delve-origin=phone` for whatever sends this desktop's notifications to the phone
+later: that one must skip them.
+
+**D-53 The agent calls out; the backend opens nothing towards the session.** The agent
+long-polls `GET /api/v1/desk/next` on the loopback with a device token of the role
+`desk`, which opens that one route (and an app's token does not open it). The other way
+round was rejected: a socket in `/run/user/<uid>` is invisible to the backend's sandbox;
+a socket in `/run/delve` would need the operator in the `delve` group, which also opens
+the root helper's socket to every program of the operator; and with `PrivateUsers` the
+backend cannot tell a peer's uid. A token in the operator's home (`~/.config/delve/
+desk.env`, 0600) that shows no conversation is the smaller exposure. The agent accepts
+only an `http://127.0.0.1` address, uses no proxy and follows no redirect, so the token
+cannot be sent elsewhere by a setting.
+
+**D-54 Nothing of a notification is kept, and the phone decides what leaves it.** The
+list of mirrored apps lives on the phone: what is not chosen there never reaches the
+backend. The backend holds commands in memory for at most a minute and writes nothing of
+them to the database or the log; the agent logs counts. One-time codes arrive without
+their content (Android hides it from notification listeners) and are shown as "Hidden
+content - check the phone".
+
 ## Rejected or deferred
 
 | Option | Outcome | Reason |
@@ -324,4 +359,6 @@ know that name. Whoever changes Hermes's `context_length` changes `LLAMA_MIN_CTX
 | Playwright `route()` as the URL guard | rejected | it does not see redirect targets; a proxy does (D-46) |
 | Terminal through the backend | rejected | the backend runs sandboxed as `delve`; it must not hold a shell of the operator (D-48) |
 | `llama-server` router mode for switching models | rejected | the `model` field would select the model for every caller (D-49) |
+| KDE Connect for notifications and the clipboard | rejected | a second app on the phone and its own pairing; everything about the machine stays in one app |
+| Backend connecting to a socket of the desktop agent | rejected | the sandbox cannot see the session, the `delve` group would open the helper (D-53) |
 | Tailscale SSH for the app's terminal | rejected | any app on the phone's VPN could log in; the SSH library does not do its check mode (D-48) |

@@ -114,6 +114,8 @@ wrong thing and puts the boundary where it cannot be talked around:
 bin/
   delve-env                 writes /etc/delve/env from a development env file
   delve-helper              root helper for the backend: fixed verbs over a unix socket
+  delve-desk                desktop agent in the operator's session: shows the phone's
+                            notifications (two verbs, asks the backend on the loopback)
   render-sudoers            fills etc/sudoers.d/agent.template from site.env, checks disks exist
   wait-llama.sh             ExecStartPre: wait up to 120 s for llama-server /health
 etc/
@@ -122,6 +124,7 @@ etc/
   sysusers.d/delve.conf     the backend's system user
   tmpfiles.d/delve-inbox.conf  the attachment inbox: 2750 delve:agent
   delve/helper.env.example  users and units the helper controls
+  delve/desk.env.example    the desktop agent's token (the operator's ~/.config/delve/desk.env)
   sudoers.d/agent.template  smartctl whitelist with @DISK_n@ placeholders
 llama/
   presets/                  one environment file per model for llama-server.service
@@ -146,6 +149,7 @@ systemd/
   delve-backend.service.d/  drop-ins: fcm.conf (outbound HTTPS), cards.conf (card store),
                             inbox.conf (attachment inbox)
   delve-helper.socket, delve-helper@.service   socket-activated helper, one request each
+  delve-desk.service        user unit for the desktop agent (graphical session)
   hermes-gateway.override.conf  drop-in for the Hermes-generated gateway unit
   reference/                the generated unit, for reference only (not edited)
 tests/
@@ -286,7 +290,21 @@ This is a record of a working setup, not a turnkey installer. Paths use
     `ssh-keyscan -p 2222 -t ed25519 127.0.0.1 | ssh-keygen -lf -`) and starts
     `env LANG=en_US.UTF-8 tmux -u new-session -A -s <name>` (an exec channel has no locale);
     the same session is reachable on the desktop with `tmux attach -t <name>`.
-20. **Reboot without logging in**, connect over SSH, run `ops/post-boot-check.sh`.
+20. **Desktop agent (Delve DA2, the phone's notifications on the desktop):** needs a
+    notification daemon in the session (`busctl --user status
+    org.freedesktop.Notifications`). `sudo install -m 0755 bin/delve-desk
+    /usr/local/lib/delve/delve-desk`; `sudo delve token create --name desk --role desk`
+    prints the agent's token once; `install -D -m 0600 etc/delve/desk.env.example
+    ~/.config/delve/desk.env` and put the token in it; check with
+    `(set -a; . ~/.config/delve/desk.env; python3 -I bin/delve-desk --check)` - it names
+    the daemon, asks the backend once and shows a test notification for 3 seconds. Then
+    `install -D -m 0644 systemd/delve-desk.service
+    ~/.config/systemd/user/delve-desk.service`, `systemctl --user daemon-reload`,
+    `systemctl --user enable --now delve-desk.service`; `journalctl --user -u delve-desk
+    -n 5` says `started: asking http://127.0.0.1:8700`. The unit belongs to the graphical
+    session: it runs while the operator is logged in and has nothing to show otherwise
+    (D-52..D-54).
+21. **Reboot without logging in**, connect over SSH, run `ops/post-boot-check.sh`.
 
 ## Tests
 
@@ -294,6 +312,7 @@ This is a record of a working setup, not a turnkey installer. Paths use
 |---|---|---|
 | `tests/test_agentcards.py` | CI + host | plugin tool: validation, event building, JSONL store (temp dir) |
 | `tests/test_delve_helper.py` | CI + host | privileged helper: request parsing, verb whitelist, job-id argument rules, exact commands, `systemctl show` / `nvidia-smi` / `hermes cron incidents` / `jobs.json` / `/proc` parsing on the samples in `tests/fixtures/system/` |
+| `tests/test_delve_desk.py` | CI + host | desktop agent: the exact `busctl` argv of the two verbs, text shown and not interpreted (leading dash, markup, control characters, lengths), replace and close by id, bad commands, the loopback-only setting, the backend's answers, the loop's pauses, nothing of a notification in the log |
 | `tests/test_updates_check.py` | CI + host | `checkupdates` parser on a real 44-package output, `updates` payload validator |
 | `tests/test_water_schema.py` | CI + host | `water` payload validator: ranges, types, time window, unknown fields |
 | `tests/test_water_level.py` | CI + host | gauge table parser against the synthetic fixture + 13 malformed variants |
@@ -310,7 +329,7 @@ This is a record of a working setup, not a turnkey installer. Paths use
 The offline tests use only the standard library and run from any directory:
 
 ```sh
-for t in test_water_level test_water_schema test_agentcards test_delve_helper test_updates_check test_watch; do python3 -I tests/$t.py; done
+for t in test_water_level test_water_schema test_agentcards test_delve_helper test_delve_desk test_updates_check test_watch; do python3 -I tests/$t.py; done
 ```
 
 The on-host tests need the live Hermes install (its Python and modules) or the running

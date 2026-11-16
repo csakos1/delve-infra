@@ -1,0 +1,347 @@
+#!/usr/bin/python3 -I
+"""Delve desktop agent: shows the phone's notifications on this desktop (DA2, D-52..D-54).
+
+A user service in the operator's graphical session (`systemd/delve-desk.service`). The
+backend runs confined as its own user and cannot reach a session bus, so the agent calls
+out: it asks the backend on the loopback for commands (`GET /api/v1/desk/next`, a long
+poll, with a token of the role `desk` that opens nothing else) and carries them out with
+the notification daemon. Two verbs, nothing more:
+
+    {"verb": "notify.show", "id", "app", "title", "body", "category", "hidden"}
+    {"verb": "notify.close", "id"}
+
+`id` (16 hex characters) names a notification of the phone; the same id again replaces
+the one shown. Every value is checked here again, then passed to `busctl` as one argument
+each - no shell, and the text is shown, never interpreted: the body's markup characters
+are escaped, the notification has no actions. A mirrored notification carries the hint
+`x-delve-origin=phone`, so whatever watches this desktop's notifications later knows not
+to send it back.
+
+    delve-desk            run (the unit does)
+    delve-desk --check    the settings, the daemon, one request, a test notification
+
+Settings come from the environment (`~/.config/delve/desk.env`, mode 0600, see
+`etc/delve/desk.env.example`): DELVE_DESK_TOKEN (required), DELVE_DESK_URL (default
+http://127.0.0.1:8700; only a loopback http address is accepted - the token must not
+leave the machine in the clear).
+
+Nothing of a notification is written anywhere: the log (stderr, the journal) has counts
+and errors. Only the standard library is used.
+"""
+
+from __future__ import annotations
+
+import html
+import http.client
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections import OrderedDict
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any
+
+BUSCTL = "/usr/bin/busctl"
+DEST = "org.freedesktop.Notifications"
+OBJECT = "/org/freedesktop/Notifications"
+
+DEFAULT_URL = "http://127.0.0.1:8700"
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+POLL_WAIT_S = 25
+HTTP_TIMEOUT_S = POLL_WAIT_S + 15
+RESPONSE_MAX = 1024 * 1024
+CALL_TIMEOUT_S = 8
+BACKOFF_S = (2, 5, 10, 30)
+REJECTED_PAUSE_S = 60
+SHOWN_MAX = 500
+COMMANDS_MAX = 400  # more than the backend ever queues
+
+ID_RE = re.compile(r"[0-9a-f]{16}")
+CATEGORY_RE = re.compile(r"[a-z_]{0,32}")
+TOKEN_RE = re.compile(r"dlv_[A-Za-z0-9_-]{20,124}")
+APP_MAX = 64
+TITLE_MAX = 256
+BODY_MAX = 2000
+# Android's categories -> the desktop specification's; others go without one
+CATEGORIES = {"msg": "im.received", "email": "email.arrived", "call": "call.incoming"}
+HIDDEN_BODY = "Hidden content - check the phone"
+ORIGIN_HINT = ("x-delve-origin", "s", "phone")
+
+CHILD_ENV_KEYS = ("DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR")
+
+
+class DeskError(Exception):
+    """Something the log should say in one line."""
+
+
+def log(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
+# --- running busctl (replaced in tests) -------------------------------------------------
+
+
+def _run(argv: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
+    env = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
+    env.update({k: os.environ[k] for k in CHILD_ENV_KEYS if k in os.environ})
+    try:
+        return subprocess.run(  # noqa: S603  # fixed program, one value per argument
+            list(argv), capture_output=True, text=True, timeout=timeout, env=env, check=False
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise DeskError(f"busctl did not answer in {timeout:g} s") from exc
+    except OSError as exc:
+        raise DeskError(f"busctl: {exc.strerror or exc}") from exc
+
+
+RUN: Callable[[Sequence[str], float], subprocess.CompletedProcess[str]] = _run
+
+
+def _call(member: str, signature: str, *args: str) -> str:
+    # `--` ends busctl's options: a title may start with a dash
+    argv = [BUSCTL, "--user", "--timeout=5", "call", "--", DEST, OBJECT, DEST, member]
+    if signature:
+        argv += [signature, *args]
+    done = RUN(argv, CALL_TIMEOUT_S)
+    if done.returncode != 0:
+        reason = (done.stderr or "").strip().splitlines()[:1]
+        raise DeskError(f"{member} failed ({done.returncode}): {reason[0] if reason else '-'}")
+    return done.stdout.strip()
+
+
+# --- the two verbs ----------------------------------------------------------------------
+
+
+def clean(value: Any, limit: int) -> str:
+    """One line of text for the daemon: a string, no control characters, at most `limit`."""
+    if not isinstance(value, str):
+        return ""
+    out = "".join(c if c in "\n\t" or (c.isprintable() and c != "\x7f") else " " for c in value)
+    return out.strip()[:limit]
+
+
+class Desk:
+    """The notifications this agent put on the desktop: the phone's id -> the daemon's."""
+
+    def __init__(self) -> None:
+        self.shown: OrderedDict[str, int] = OrderedDict()
+
+    def handle(self, command: Any) -> str:
+        """Carry out one command; returns the verb done, raises DeskError otherwise."""
+        if not isinstance(command, dict):
+            raise DeskError("a command must be an object")
+        verb, nid = command.get("verb"), command.get("id")
+        if not isinstance(nid, str) or not ID_RE.fullmatch(nid):
+            raise DeskError("a command needs an id of 16 hex characters")
+        if verb == "notify.show":
+            self.show(nid, command)
+        elif verb == "notify.close":
+            self.close(nid)
+        else:
+            raise DeskError("unknown verb")
+        return str(verb)
+
+    def show(self, nid: str, command: Mapping[str, Any]) -> None:
+        app = clean(command.get("app"), APP_MAX).replace("\n", " ") or "Phone"
+        title = clean(command.get("title"), TITLE_MAX).replace("\n", " ")
+        body = clean(command.get("body"), BODY_MAX)
+        if command.get("hidden") is True:
+            title, body = "", HIDDEN_BODY
+        category = command.get("category")
+        if not isinstance(category, str) or not CATEGORY_RE.fullmatch(category):
+            category = ""
+        hints: list[tuple[str, str, str]] = [("urgency", "y", "1"), ORIGIN_HINT]
+        if category in CATEGORIES:
+            hints.append(("category", "s", CATEGORIES[category]))
+        args = [
+            app,  # app_name
+            str(self.shown.get(nid, 0)),  # replaces_id
+            "",  # app_icon
+            title or app,  # summary: plain text by the specification
+            html.escape(body, quote=False),  # body: the daemon reads markup here
+            "0",  # actions: none
+            str(len(hints)),
+            *(part for hint in hints for part in hint),
+            "-1",  # expire_timeout: the daemon's own
+        ]
+        answer = _call("Notify", "susssasa{sv}i", *args)
+        match = re.fullmatch(r"u (\d+)", answer)
+        if match is None:
+            raise DeskError("Notify answered without an id")
+        self.shown[nid] = int(match.group(1))
+        self.shown.move_to_end(nid)
+        while len(self.shown) > SHOWN_MAX:
+            self.shown.popitem(last=False)
+
+    def close(self, nid: str) -> None:
+        desktop_id = self.shown.pop(nid, None)
+        if desktop_id is not None:  # one that never got here is nothing to close
+            _call("CloseNotification", "u", str(desktop_id))
+
+
+# --- the backend ------------------------------------------------------------------------
+
+
+def settings(env: Mapping[str, str]) -> tuple[str, str]:
+    """(base url, token) or DeskError."""
+    token = env.get("DELVE_DESK_TOKEN", "").strip()
+    if not TOKEN_RE.fullmatch(token):
+        raise DeskError("DELVE_DESK_TOKEN is missing or not a device token (dlv_...)")
+    url = env.get("DELVE_DESK_URL", "").strip() or DEFAULT_URL
+    parts = urllib.parse.urlsplit(url)
+    if (
+        parts.scheme != "http"
+        or parts.hostname not in LOOPBACK_HOSTS
+        or parts.username is not None
+        or parts.path not in ("", "/")
+        or parts.query
+        or parts.fragment
+    ):
+        raise DeskError("DELVE_DESK_URL must be http://127.0.0.1:<port> (loopback only)")
+    return url.rstrip("/"), token
+
+
+def _fetch(url: str, token: str, timeout: float) -> tuple[int, bytes]:
+    """GET; (status, body). No proxy from the environment, no redirects followed."""
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    request = urllib.request.Request(  # noqa: S310  # loopback http, checked in settings()
+        url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    )
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            return response.status, response.read(RESPONSE_MAX + 1)
+    except urllib.error.HTTPError as exc:
+        return exc.code, b""
+
+
+FETCH: Callable[[str, str, float], tuple[int, bytes]] = _fetch
+
+
+class Rejected(DeskError):
+    """The backend does not take the token."""
+
+
+def poll(base: str, token: str, wait: int = POLL_WAIT_S) -> list[Any]:
+    """One request; the commands, or DeskError (Rejected for a 401)."""
+    try:
+        status, body = FETCH(f"{base}/api/v1/desk/next?wait={wait}", token, wait + 15)
+    except (OSError, ValueError, http.client.HTTPException) as exc:  # URLError: an OSError
+        reason = getattr(exc, "reason", None) or exc
+        raise DeskError(f"backend not reachable: {reason}") from exc
+    if status == 401:
+        raise Rejected("the backend rejects the token (role desk? revoked?)")
+    if status != 200:
+        raise DeskError(f"backend answered {status}")
+    if len(body) > RESPONSE_MAX:
+        raise DeskError("backend answer too large")
+    try:
+        commands = json.loads(body.decode("utf-8"))["commands"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise DeskError("backend answer is not {commands: [...]}") from exc
+    if not isinstance(commands, list) or len(commands) > COMMANDS_MAX:
+        raise DeskError("backend answer is not {commands: [...]}")
+    return commands
+
+
+def carry_out(desk: Desk, commands: Sequence[Any]) -> tuple[int, int]:
+    """(done, failed); a failed command does not stop the ones after it."""
+    done = failed = 0
+    for command in commands:
+        try:
+            desk.handle(command)
+            done += 1
+        except DeskError as exc:
+            failed += 1
+            log(f"command failed: {exc}")
+    return done, failed
+
+
+def serve(
+    env: Mapping[str, str],
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    rounds: int | None = None,
+) -> int:
+    """The loop; `rounds` and `sleep` are for tests."""
+    try:
+        base, token = settings(env)
+    except DeskError as exc:
+        log(f"not started: {exc}")
+        return 2
+    desk = Desk()
+    failures = 0
+    log(f"started: asking {base}")
+    while rounds is None or rounds > 0:
+        if rounds is not None:
+            rounds -= 1
+        try:
+            commands = poll(base, token)
+        except Rejected as exc:
+            log(str(exc))
+            sleep(REJECTED_PAUSE_S)
+            continue
+        except DeskError as exc:
+            if failures == 0:  # once per outage, not once per attempt
+                log(str(exc))
+            sleep(BACKOFF_S[min(failures, len(BACKOFF_S) - 1)])
+            failures += 1
+            continue
+        if failures:
+            log("backend reachable again")
+            failures = 0
+        if commands:
+            done, failed = carry_out(desk, commands)
+            log(f"commands: {done} done, {failed} failed, {len(desk.shown)} shown")
+    return 0
+
+
+def check(env: Mapping[str, str]) -> int:
+    """`--check`: each part once, in words; 0 when all of it works."""
+    try:
+        base, token = settings(env)
+        print(f"settings: ok ({base})")
+        info = _call("GetServerInformation", "")
+        print(f"notification daemon: {info}")
+        commands = poll(base, token, wait=0)
+        print(f"backend: ok ({len(commands)} waiting)")
+        desk = Desk()
+        carry_out(desk, commands)
+        nid = "0" * 16
+        desk.show(nid, {"app": "Delve", "title": "Delve desktop agent", "body": "It works."})
+        print("test notification: shown (closing it in 3 s)")
+        time.sleep(3)
+        desk.close(nid)
+    except DeskError as exc:
+        print(f"FAILED: {exc}")
+        return 1
+    return 0
+
+
+def main(argv: Sequence[str]) -> int:
+    if list(argv) not in ([], ["--check"]):
+        print("usage: delve-desk [--check]", file=sys.stderr)
+        return 2
+
+    def stop(_signum: int, _frame: Any) -> None:
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    try:
+        return check(os.environ) if argv else serve(os.environ)
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

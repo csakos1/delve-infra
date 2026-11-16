@@ -1,0 +1,32 @@
+# Delve desktop agent: a user unit of the operator, in the graphical session (D-52).
+# It asks the backend on the loopback for the phone's notifications and shows them with
+# the session's notification daemon; it takes no connections itself.
+# Install: bin/delve-desk -> /usr/local/lib/delve/delve-desk (root 0755),
+#          this file -> ~/.config/systemd/user/delve-desk.service,
+#          etc/delve/desk.env.example -> ~/.config/delve/desk.env (0600, with the token),
+#          `systemctl --user enable --now delve-desk.service`.
+# Check:   `set -a; . ~/.config/delve/desk.env; set +a; python3 -I bin/delve-desk --check`
+[Unit]
+Description=Delve desktop agent (the phone's notifications on this desktop)
+PartOf=graphical-session.target
+After=graphical-session.target swaync.service
+
+[Service]
+EnvironmentFile=%h/.config/delve/desk.env
+ExecStart=/usr/bin/python3 -I /usr/local/lib/delve/delve-desk
+Restart=on-failure
+RestartSec=10
+MemoryMax=64M
+TasksMax=16
+
+# What a user manager applies without privileges (measured on the host, DA2 fixtures).
+# Not PrivateNetwork: the backend is on the loopback. The session bus is a unix socket.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=graphical-session.target
