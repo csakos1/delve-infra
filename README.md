@@ -125,6 +125,7 @@ etc/
   sysusers.d/delve.conf     the backend's system user
   tmpfiles.d/delve-inbox.conf  the attachment inbox: 2750 delve:agent
   tmpfiles.d/delve-persona.conf  the personal profile's directory: 2750 delve:agent
+  tmpfiles.d/delve-news.conf  the News feed list the backend writes: 2750 delve:agent
   delve/helper.env.example  users and units the helper controls
   delve/desk.env.example    the desktop agent's token (the operator's ~/.config/delve/desk.env)
   sudoers.d/agent.template  smartctl whitelist with @DISK_n@ placeholders
@@ -135,12 +136,15 @@ hermes/
   config.fragments.yaml     curated, secret-free excerpt of the agent's config.yaml
   cron/balaton-water.sh     idempotent creation of the water-level cron job
   cron/arch-updates.sh      idempotent creation of the package-update cron job
+  cron/news.sh              idempotent creation of the News collector's cron job
   plugins/agentcards/       Hermes plugin: card schema, validator, JSONL store, tools
                             (publish_water_card, page_fetch, watch_manage), watchlib.py,
                             recipes.py (recipes on any page), render_page.py (headless
-                            Chromium behind a filtering proxy; runs in its own venv)
+                            Chromium behind a filtering proxy; runs in its own venv),
+                            newslib.py (the News collector: feeds -> batch files)
   scripts/water_level.py    no-agent cron script: lake gauge → `water` card (stdlib only)
   scripts/updates_check.py  no-agent cron script: checkupdates → `updates` card (stdlib only)
+  scripts/news_collect.py   no-agent cron script: the News feeds → `cards/news/batch-*.json`
 ops/
   config-check.py           dump / verify the live config against the fragment
   deny-check.sh             run the deny matrix as the agent user
@@ -150,7 +154,8 @@ systemd/
   llama-server.service      user unit for the model server (loads the active preset)
   delve-backend.service     system unit for the backend, hardened (loopback only)
   delve-backend.service.d/  drop-ins: fcm.conf (outbound HTTPS), cards.conf (card store),
-                            inbox.conf (attachment inbox), persona.conf (personal profile)
+                            inbox.conf (attachment inbox), persona.conf (personal profile),
+                            news.conf (the News feed list)
   delve-helper.socket, delve-helper@.service   socket-activated helper, one request each
   delve-desk.service        user unit for the desktop agent (graphical session)
   hermes-gateway.override.conf  drop-in for the Hermes-generated gateway unit
@@ -323,7 +328,24 @@ This is a record of a working setup, not a turnkey installer. Paths use
     `sudo install -o delve -g agent -m 0640 topics/*.md /var/lib/delve-persona/topics/`.
     A chat started after that gets the core in its instructions and the list of topic
     files; a chat that is already running keeps what it started with (D-56, D-57).
-22. **Reboot without logging in**, connect over SSH, run `ops/post-boot-check.sh`.
+22. **News (Delve N1):** an hourly no-agent job reads the feeds the backend lists and
+    hands the new items back as batch files; the backend scores and stores them (D-58).
+    The list of feeds and topics says what the operator reads - it lives in the backend's
+    database and in `/var/lib/delve-news`, in no repository:
+    ```sh
+    sudo install -m 0644 etc/tmpfiles.d/delve-news.conf /etc/tmpfiles.d/
+    sudo systemd-tmpfiles --create delve-news.conf
+    sudo install -m 0644 systemd/delve-backend.service.d/news.conf /etc/systemd/system/delve-backend.service.d/
+    sudo systemctl daemon-reload && sudo systemctl restart delve-backend
+    ```
+    Copy `hermes/plugins/agentcards/` to `~agent/.hermes/plugins/` and
+    `hermes/scripts/news_collect.py` to `~agent/.hermes/scripts/`, restart the gateway, then
+    `sh hermes/cron/news.sh` as `agent`. The backend writes `sources.json` once it has
+    sources (`sudo delve news import < news.json`, the format in the backend's
+    `deploy/news.example.json`); until then a run does nothing. Check with
+    `python3 -I ~/.hermes/scripts/news_collect.py --dry-run` as `agent` and
+    `ls ~agent/.hermes/cards/news/`.
+23. **Reboot without logging in**, connect over SSH, run `ops/post-boot-check.sh`.
 
 ## Tests
 
@@ -336,6 +358,7 @@ This is a record of a working setup, not a turnkey installer. Paths use
 | `tests/test_water_schema.py` | CI + host | `water` payload validator: ranges, types, time window, unknown fields |
 | `tests/test_water_level.py` | CI + host | gauge table parser against the synthetic fixture + 13 malformed variants |
 | `tests/test_watch.py` | CI + host | watchers: public-address guard (incl. redirects), hardverapro / cinemacity / generic parsers on synthetic pages, filters, config rules, the run cycle (baseline, new items, cap, errors, `watch_*` cards), `page_fetch`, `watch_manage` against a fake Hermes cron |
+| `tests/test_news.py` | CI + host | News collector: the sources file, RSS 2.0 / RSS 1.0 / Atom parsing (a DTD refused), Google News titles and publishers, URL normalisation, the time window, the run cycle (due sources, 304, a 429 with `Retry-After`, seen items, the time budget, removed sources), the batch file and the state, real HTTP on the loopback with the public-address guard on the feed and on a redirect |
 | `tests/test_recipes.py` | CI + host | recipes: selectors, JSON paths, recipe validation, list / JSON / condition extraction, the candidate finder on synthetic list / `__NEXT_DATA__` / product / API / JavaScript-shell pages, robots.txt (rules, 4xx, unreachable, cache), the run cycle (baseline, `recipe_empty`, recipe change, condition edges), `watch_manage` with candidates and the preview gate, the renderer wrapper; with Playwright and a Chromium also `render_page.py` itself (a JavaScript-built list, its API captured, a redirect and a fetch to loopback refused) |
 | fixture reproducibility | CI | `make_tohid_synthetic.py` and `make_watch_synthetic.py` regenerate byte-identical fixtures |
 | script dry-run | CI | `water_level.py --dry-run` and `updates_check.py --dry-run` produce valid v1 `water` / `updates` events |
@@ -348,7 +371,7 @@ This is a record of a working setup, not a turnkey installer. Paths use
 The offline tests use only the standard library and run from any directory:
 
 ```sh
-for t in test_water_level test_water_schema test_agentcards test_delve_helper test_delve_desk test_updates_check test_watch; do python3 -I tests/$t.py; done
+for t in test_water_level test_water_schema test_agentcards test_delve_helper test_delve_desk test_updates_check test_watch test_recipes test_news; do python3 -I tests/$t.py; done
 ```
 
 The on-host tests need the live Hermes install (its Python and modules) or the running

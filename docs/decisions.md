@@ -379,6 +379,34 @@ The backend therefore stores the text with the conversation at its first run, an
 applies to the chats started after it. Every agent run gets the profile, scheduled ones
 too: runs with and without it would evict each other's cached prefix (3-4 s each time).
 
+## News (Delve N)
+
+**D-58 The agent's user collects the news; the backend never fetches the web.** An hourly
+no-agent cron job (`news`, `hermes/scripts/news_collect.py` → `newslib.py`) reads the feeds
+the backend lists in `/var/lib/delve-news/sources.json` (2750 `delve:agent`: the backend
+writes, the agent reads, like the profile) and hands the new items back as batch files in
+the card directory (`~/.hermes/cards/news/batch-*.json`, which the backend sees read-only
+through `cards.conf`; kept 3 days). The backend stores, scores, groups and summarises them
+with direct llama calls without tools; the agent's model is not involved. Why not in the
+backend: its unit has outbound access only because FCM needs it, it has no D-41 guard, it
+cannot run Chromium (needed to follow Google News links, N1b), and it holds the database
+and the device tokens - web content is parsed in a process that holds none of that.
+Feed-reader mode (the user's choice, 2026-11-17, after N0 found that the robots.txt of
+Google News, GitHub and Reddit refuse unknown agents for their feeds): a URL a site hands
+out for subscribing to - RSS / Atom, GitHub `releases.atom`, Reddit `.rss` - is read
+without a robots.txt check, at most hourly, with an honest user agent
+(`DelveNews/0.1 (personal news reader)`); article pages are read only where robots.txt
+allows the `delve-news` token (N1b, the D-47 rules); a Google News item link is a redirect
+inside the feed, its robots.txt is the publisher's. Nothing is disguised: no browser user
+agent for feeds, no unofficial tokens - a feed that refuses (403) stays out. Every URL and
+redirect passes D-41; requests to one host are spaced (2 s, Reddit 10 s, shared with the
+watchers' stamps); a 429 / 503 waits for `Retry-After` (at most 6 h, 1 h without it);
+ETag / Last-Modified make an unchanged feed a 304. A feed with a DTD is refused (no
+entities). The lists of feeds and topics say what the operator reads and are in no
+repository (the backend's `deploy/news.example.json` shows the format with invented
+interests). Article text, once read (N1b), stays on this machine and the phone for
+personal reading and is deleted after 30 days unless saved.
+
 ## Rejected or deferred
 
 | Option | Outcome | Reason |
@@ -403,4 +431,6 @@ too: runs with and without it would evict each other's cached prefix (3-4 s each
 | KDE Connect for notifications and the clipboard | rejected | a second app on the phone and its own pairing; everything about the machine stays in one app |
 | Backend connecting to a socket of the desktop agent | rejected | the sandbox cannot see the session, the `delve` group would open the helper (D-53) |
 | Hermes' own `memory` toolset as the profile's store | deferred | only the agent would see it (not the General chats) and the 27B would write it unsupervised; kept off, to be looked at again for "remember this" (D-56) |
+| Backend fetching the news feeds itself | rejected | no URL guard, no Chromium, it holds the database and tokens; the agent's user collects (D-58) |
+| Browser user agent or unofficial API tokens for feeds that refuse | rejected | a refusing feed stays out; Reddit's API needs approval since 2025-11 (D-58) |
 | Tailscale SSH for the app's terminal | rejected | any app on the phone's VPN could log in; the SSH library does not do its check mode (D-48) |

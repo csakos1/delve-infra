@@ -25,6 +25,7 @@ command -v delve >/dev/null && sudo delve helper host.status 2>&1 | head -c 300;
 command -v delve >/dev/null && sudo delve helper agent.incidents 2>&1 | head -c 300; echo
 echo "=== attachment inbox ==="; sudo stat -c '%n %U:%G %A' /var/lib/delve-inbox
 echo "=== personal profile ==="; sudo stat -c '%n %U:%G %A' /var/lib/delve-persona /var/lib/delve-persona/topics
+echo "=== news ==="; sudo stat -c '%n %U:%G %A' /var/lib/delve-news; sudo ls -t /home/agent/.hermes/cards/news 2>/dev/null | head -1
 echo "=== terminal ssh (2222) ==="
 ss -ltnH '( sport = :2222 )' | awk '{print $4}' | sort -u | tr '\n' ' '; echo
 echo "=== agent: gateway (s boot óta) ==="
