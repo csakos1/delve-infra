@@ -17,6 +17,13 @@ Every URL - the feed and each redirect - goes through the watchers' public-addre
 files). A 429 / 503 is a rate limit: ``Retry-After`` is honoured, the source waits.
 ETag / Last-Modified make an unchanged feed a cheap 304.
 
+Article texts (N1c, a second no-agent job ``news-text``, ``news_texts.py`` ->
+``texts_main()``): the backend lists the stories it wants a text of in
+``$DELVE_NEWS_DIR/wanted.json``; the job hands them to ``newstext.py`` in the renderer's venv
+(Playwright for the Google News links, trafilatura for the text) under the renderer's lock,
+and writes the answer as ``cards/news/text-<UTC stamp>.json``. An item is asked once per
+``try`` (the backend raises it when the user asks again).
+
 Exit codes: 0 ok (single sources may have failed - the batch says which), 4 the sources
 file is unreadable or invalid, 3 the batch or the state could not be written.
 """
@@ -31,6 +38,7 @@ import html
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -75,6 +83,14 @@ BATCH_KEEP_DAYS = 3
 SOURCE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{0,47}$")
 KINDS = ("feed", "release")
 SLEEP = time.sleep                  # replaced in tests
+# N1c: article texts
+ACCEPT_HTML = "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8"
+TEXT_MAX_ITEMS = 40            # per run
+TEXT_BUDGET_S = 180.0          # no new item is started after this
+TEXT_TIMEOUT_S = TEXT_BUDGET_S + 120.0
+TEXT_LOCK_WAIT_S = 120.0       # the renderer's lock (a watcher may be rendering)
+TEXT_KEEP_DAYS = 3             # the state remembers an asked id:try this long
+RENDER_HOME = os.path.join(HERMES_HOME, "delve-render")
 
 EXIT_OK, EXIT_STORE, EXIT_CONFIG = 0, 3, 4
 
@@ -246,12 +262,13 @@ def space(host: str, host_dir: str | None = None) -> None:
 
 
 def http_get(url: str, *, etag: str | None = None, modified: str | None = None,
-             resolver: wl.Resolver = wl._resolve, host_dir: str | None = None) -> Response:
+             resolver: wl.Resolver = wl._resolve, host_dir: str | None = None,
+             accept: str = ACCEPT_FEED) -> Response:
     """One GET through the public-address guard (every redirect too). 304 and 4xx/5xx come
     back as a Response, not an exception; a blocked or unreachable URL raises."""
     wl.check_url(url, resolver)
     space((urllib.parse.urlsplit(url).hostname or "").lower(), host_dir)
-    headers = {"User-Agent": USER_AGENT, "Accept": ACCEPT_FEED,
+    headers = {"User-Agent": USER_AGENT, "Accept": accept,
                "Accept-Language": "hu-HU,hu;q=0.9,en;q=0.7"}
     if etag:
         headers["If-None-Match"] = etag
@@ -265,7 +282,7 @@ def http_get(url: str, *, etag: str | None = None, modified: str | None = None,
         with opener.open(req, timeout=FETCH_TIMEOUT_S) as r:
             body = r.read(MAX_BYTES + 1)
             if len(body) > MAX_BYTES:
-                raise NewsError(f"feed larger than {MAX_BYTES} bytes", "too_large")
+                raise NewsError(f"larger than {MAX_BYTES} bytes", "too_large")
             return Response(r.status, _pick(r.headers), body, r.geturl())
     except urllib.error.HTTPError as exc:
         return Response(exc.code, _pick(exc.headers), None, url)
@@ -617,16 +634,182 @@ def write_batch(batch: dict[str, Any], out_dir: str | None = None,
     stamp = now.astimezone(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     path = os.path.join(d, f"batch-{stamp}-{os.getpid()}.json")
     _write_json(path, batch, 0o644)
+    _clean_old(d, "batch-")
+    return path
+
+
+def _clean_old(d: str, prefix: str) -> None:
     cutoff = time.time() - BATCH_KEEP_DAYS * 86400
     for name in os.listdir(d):
-        if name.startswith("batch-") and name.endswith(".json"):
+        if name.startswith(prefix) and name.endswith(".json"):
             p = os.path.join(d, name)
             try:
                 if os.path.getmtime(p) < cutoff:
                     os.unlink(p)
             except OSError:
                 pass
+
+
+# --- article texts (N1c) ----------------------------------------------------------------
+
+
+def validate_wanted(data: Any) -> list[dict[str, Any]]:
+    """The backend's wanted.json -> [{id, url, gn, try}]; ConfigError if it is not one."""
+    if not isinstance(data, dict) or data.get("v") != 1 or not isinstance(data.get("items"), list):
+        raise ConfigError("wanted.json: expected {\"v\": 1, \"items\": [...]}")
+    out, ids = [], set()
+    for i, it in enumerate(data["items"][:200]):
+        if not isinstance(it, dict):
+            raise ConfigError(f"items[{i}]: not an object")
+        iid, url, tries = it.get("id"), it.get("url"), it.get("try", 1)
+        if not isinstance(iid, int) or isinstance(iid, bool) or iid < 1 or iid in ids:
+            raise ConfigError(f"items[{i}]: bad or repeated id")
+        if not isinstance(url, str) or not url.startswith(("https://", "http://")) \
+                or len(url) > URL_CHARS:
+            raise ConfigError(f"items[{i}] {iid}: bad url")
+        if not isinstance(tries, int) or isinstance(tries, bool) or not 1 <= tries <= 1000:
+            raise ConfigError(f"items[{i}] {iid}: bad try")
+        ids.add(iid)
+        out.append({"id": iid, "url": url, "gn": bool(it.get("gn")), "try": tries})
+    return out
+
+
+def load_wanted(news_dir: str | None = None) -> list[dict[str, Any]]:
+    path = os.path.join(news_dir or NEWS_DIR, "wanted.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = f.read(1024 * 1024)
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise ConfigError(f"wanted.json: {exc}") from None
+    try:
+        return validate_wanted(json.loads(raw))
+    except ValueError as exc:
+        raise ConfigError(f"wanted.json: not JSON ({exc})") from None
+
+
+def to_fetch(wanted: list[dict[str, Any]], st: dict[str, Any], now: dt.datetime,
+             limit: int = TEXT_MAX_ITEMS) -> list[dict[str, Any]]:
+    """The wanted items not asked yet (id:try), at most ``limit``; old marks are dropped."""
+    done: dict[str, float] = st.setdefault("texts", {})
+    cutoff = (now - dt.timedelta(days=TEXT_KEEP_DAYS)).timestamp()
+    for k in [k for k, v in done.items() if not isinstance(v, (int, float)) or v < cutoff]:
+        del done[k]
+    return [w for w in wanted if f"{w['id']}:{w['try']}" not in done][:limit]
+
+
+def run_worker(items: list[dict[str, Any]], *, python: str | None = None,
+               script: str | None = None, lock_path: str | None = None,
+               budget_s: float = TEXT_BUDGET_S, timeout_s: float = TEXT_TIMEOUT_S,
+               lock_wait_s: float = TEXT_LOCK_WAIT_S) -> dict[str, Any]:
+    """newstext.py in the renderer's venv, one run, under the renderer's lock. NewsError
+    (render_unavailable, render_busy, text_timeout, text_failed) when there is no answer."""
+    python = python or os.environ.get("DELVE_NEWS_TEXT_PYTHON") \
+        or os.path.join(RENDER_HOME, "venv", "bin", "python")
+    script = script or os.environ.get("DELVE_NEWS_TEXT_SCRIPT") or os.path.join(HERE, "newstext.py")
+    if not (os.access(python, os.X_OK) and os.path.isfile(script)):
+        raise NewsError("the renderer's venv is not installed", "render_unavailable")
+    lock_path = lock_path or os.path.join(wl.WATCH_DIR, ".render.lock")
+    env = {"HOME": os.path.expanduser("~"), "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8",
+           "HERMES_HOME": HERMES_HOME, "DELVE_NEWS_DIR": NEWS_DIR}
+    for k in ("DELVE_CHROMIUM", "DELVE_RENDER_TEST_HOSTS"):
+        if os.environ.get(k):
+            env[k] = os.environ[k]
+    os.makedirs(os.path.dirname(lock_path), mode=0o700, exist_ok=True)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        deadline = time.monotonic() + lock_wait_s
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise NewsError("the renderer is busy", "render_busy") from None
+                time.sleep(0.5)
+        payload = json.dumps({"v": 1, "budget_s": budget_s, "items": items})
+        try:
+            r = subprocess.run([python, "-I", script], input=payload.encode("utf-8"),
+                               capture_output=True, timeout=timeout_s, env=env)
+        except subprocess.TimeoutExpired:
+            raise NewsError("the text worker took too long", "text_timeout") from None
+    finally:
+        os.close(fd)
+    try:
+        out = json.loads(r.stdout.decode("utf-8", "replace"))
+        if not isinstance(out, dict) or not isinstance(out.get("items"), list):
+            raise ValueError("no items")
+    except ValueError:
+        tail = r.stderr.decode("utf-8", "replace")[-300:]
+        raise NewsError(f"the text worker gave no answer: {tail}", "text_failed") from None
+    return out
+
+
+def write_texts(result: dict[str, Any], out_dir: str | None = None,
+                now: dt.datetime | None = None) -> str:
+    """The texts file for the backend, next to the batches (0644); old ones are removed."""
+    d = out_dir or OUT_DIR
+    os.makedirs(d, mode=0o755, exist_ok=True)
+    os.chmod(d, 0o755)
+    now = now or _now()
+    stamp = now.astimezone(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = os.path.join(d, f"text-{stamp}-{os.getpid()}.json")
+    _write_json(path, {"v": 1, "at": _iso(now), **result}, 0o644)
+    _clean_old(d, "text-")
     return path
+
+
+def texts_main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="fetch the article texts the backend wants, once")
+    ap.add_argument("--dry-run", action="store_true", help="list what would be fetched")
+    args = ap.parse_args(argv)
+    try:
+        wanted = load_wanted()
+    except ConfigError as exc:
+        log(f"texts: {exc.code}: {exc}")
+        return EXIT_CONFIG
+    if not wanted:
+        return EXIT_OK
+    fd = _lock()
+    if fd is None:
+        log("texts: a collection is running; next time")
+        return EXIT_OK
+    try:
+        now = _now()
+        st = load_state()
+        todo = to_fetch(wanted, st, now)
+        if args.dry_run:
+            print(json.dumps({"wanted": len(wanted), "to_fetch": todo}, indent=1))
+            return EXIT_OK
+        if not todo:
+            return EXIT_OK
+        try:
+            result = run_worker(todo)
+        except NewsError as exc:
+            log(f"texts: {exc.code}: {exc}")
+            return EXIT_OK
+        asked = {(w["id"], w["try"]) for w in todo}
+        items = [i for i in result["items"] if isinstance(i, dict)
+                 and (i.get("id"), i.get("try")) in asked]
+        result["items"] = items
+        try:
+            write_texts(result, now=now)
+            for i in items:
+                st["texts"][f"{i['id']}:{i['try']}"] = now.timestamp()
+            save_state(st)
+        except OSError as exc:
+            log(f"texts: store_failed: {type(exc).__name__}: {exc}")
+            return EXIT_STORE
+        by: dict[str, int] = {}
+        for i in items:
+            by[str(i.get("status"))] = by.get(str(i.get("status")), 0) + 1
+        log(f"texts: {len(items)} of {len(todo)} asked ("
+            + ", ".join(f"{k} {v}" for k, v in sorted(by.items()))
+            + f"), {result.get('run_s')} s")
+        return EXIT_OK
+    finally:
+        os.close(fd)
 
 
 def _lock(base: str | None = None) -> int | None:

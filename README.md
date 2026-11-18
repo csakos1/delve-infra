@@ -137,14 +137,18 @@ hermes/
   cron/balaton-water.sh     idempotent creation of the water-level cron job
   cron/arch-updates.sh      idempotent creation of the package-update cron job
   cron/news.sh              idempotent creation of the News collector's cron job
+  cron/news-text.sh         idempotent creation of the News article-text job (N1c)
   plugins/agentcards/       Hermes plugin: card schema, validator, JSONL store, tools
                             (publish_water_card, page_fetch, watch_manage), watchlib.py,
                             recipes.py (recipes on any page), render_page.py (headless
                             Chromium behind a filtering proxy; runs in its own venv),
-                            newslib.py (the News collector: feeds -> batch files)
+                            newslib.py (the News collector: feeds -> batch files;
+                            the article-text run), newstext.py (the article texts: Google
+                            News links in the browser, robots.txt, the text; renderer's venv)
   scripts/water_level.py    no-agent cron script: lake gauge → `water` card (stdlib only)
   scripts/updates_check.py  no-agent cron script: checkupdates → `updates` card (stdlib only)
   scripts/news_collect.py   no-agent cron script: the News feeds → `cards/news/batch-*.json`
+  scripts/news_texts.py     no-agent cron script: the wanted article texts → `cards/news/text-*.json`
 ops/
   config-check.py           dump / verify the live config against the fragment
   deny-check.sh             run the deny matrix as the agent user
@@ -345,6 +349,21 @@ This is a record of a working setup, not a turnkey installer. Paths use
     `deploy/news.example.json`); until then a run does nothing. Check with
     `python3 -I ~/.hermes/scripts/news_collect.py --dry-run` as `agent` and
     `ls ~agent/.hermes/cards/news/`.
+
+    **Article texts (N1c):** the backend lists the stories it wants a text of in
+    `/var/lib/delve-news/wanted.json`; a second no-agent job (`news-text`, at :47) opens
+    their Google News links in the renderer's browser up to the publisher's address,
+    reads robots.txt with the `delve-news` token, fetches the page and extracts the text,
+    and writes `cards/news/text-*.json` for the backend (D-59). It needs trafilatura in
+    the renderer's venv (step 18) and its files: as `agent`
+    ```sh
+    ~/.hermes/delve-render/venv/bin/pip install trafilatura
+    ```
+    copy `hermes/plugins/agentcards/` (with `newstext.py`) and
+    `hermes/scripts/news_texts.py` again, then `sh hermes/cron/news-text.sh`. Check with
+    `python3 -I ~/.hermes/scripts/news_texts.py --dry-run` (what would be fetched) and,
+    after a run, `tail ~/.hermes/logs/news.log` (`texts: N of M asked (ok …)`). Without
+    the venv the job logs `render_unavailable` and the stories wait.
 23. **Reboot without logging in**, connect over SSH, run `ops/post-boot-check.sh`.
 
 ## Tests
@@ -359,6 +378,7 @@ This is a record of a working setup, not a turnkey installer. Paths use
 | `tests/test_water_level.py` | CI + host | gauge table parser against the synthetic fixture + 13 malformed variants |
 | `tests/test_watch.py` | CI + host | watchers: public-address guard (incl. redirects), hardverapro / cinemacity / generic parsers on synthetic pages, filters, config rules, the run cycle (baseline, new items, cap, errors, `watch_*` cards), `page_fetch`, `watch_manage` against a fake Hermes cron |
 | `tests/test_news.py` | CI + host | News collector: the sources file, RSS 2.0 / RSS 1.0 / Atom parsing (a DTD refused), Google News titles and publishers, URL normalisation, the time window, the run cycle (due sources, 304, a 429 with `Retry-After`, seen items, the time budget, removed sources), the batch file and the state, real HTTP on the loopback with the public-address guard on the feed and on a redirect |
+| `tests/test_newstext.py` | CI + host | News article texts: `wanted.json`, the id:try marks, the run with a stand-in worker (texts file, state, missing venv, bad answer, busy renderer), the worker on loopback servers (robots.txt with `delve-news`: rules, refusal, unreachable, cache; the text of `<article>`, too little text, HTTP errors, a 403 tried in the browser); with Playwright and a Chromium the Google News step for real (script redirect, consent page, a dead end, the publisher's page never loaded by the browser) |
 | `tests/test_recipes.py` | CI + host | recipes: selectors, JSON paths, recipe validation, list / JSON / condition extraction, the candidate finder on synthetic list / `__NEXT_DATA__` / product / API / JavaScript-shell pages, robots.txt (rules, 4xx, unreachable, cache), the run cycle (baseline, `recipe_empty`, recipe change, condition edges), `watch_manage` with candidates and the preview gate, the renderer wrapper; with Playwright and a Chromium also `render_page.py` itself (a JavaScript-built list, its API captured, a redirect and a fetch to loopback refused) |
 | fixture reproducibility | CI | `make_tohid_synthetic.py` and `make_watch_synthetic.py` regenerate byte-identical fixtures |
 | script dry-run | CI | `water_level.py --dry-run` and `updates_check.py --dry-run` produce valid v1 `water` / `updates` events |
@@ -371,7 +391,7 @@ This is a record of a working setup, not a turnkey installer. Paths use
 The offline tests use only the standard library and run from any directory:
 
 ```sh
-for t in test_water_level test_water_schema test_agentcards test_delve_helper test_delve_desk test_updates_check test_watch test_recipes test_news; do python3 -I tests/$t.py; done
+for t in test_water_level test_water_schema test_agentcards test_delve_helper test_delve_desk test_updates_check test_watch test_recipes test_news test_newstext; do python3 -I tests/$t.py; done
 ```
 
 The on-host tests need the live Hermes install (its Python and modules) or the running
@@ -407,8 +427,9 @@ Run after any Hermes, `llama.cpp`, kernel or NVIDIA/CUDA update:
 9. Offline tests + `water_level.py --dry-run --force`.
 10. Cron job active, a manual run `succeeded`, no open incidents.
 11. `ops/config-check.py --fragment …` → all keys match; rendered sudoers byte-identical.
-12. After a Chromium or Playwright update: `tests/test_recipes.py` as the agent user with
-    `~/.hermes/delve-render/venv/bin/python` (the live renderer tests run, not skip).
+12. After a Chromium or Playwright update: `tests/test_recipes.py` and
+    `tests/test_newstext.py` as the agent user with `~/.hermes/delve-render/venv/bin/python`
+    (the live renderer and Google News tests run, not skip).
 
 ## Measurements
 

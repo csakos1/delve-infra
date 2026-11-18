@@ -407,6 +407,22 @@ repository (the backend's `deploy/news.example.json` shows the format with inven
 interests). Article text, once read (N1b), stays on this machine and the phone for
 personal reading and is deleted after 30 days unless saved.
 
+**D-59 Article texts: the browser only finds the address, plain HTTP reads the page.**
+The backend lists the stories worth a text in `/var/lib/delve-news/wanted.json` (the best
+three of each topic, every 9, the saved ones and the ones the user asks for); a second
+hourly no-agent job (`news-text`) hands them to `newstext.py` in the renderer's venv under
+the renderer's lock and returns `cards/news/text-*.json`. A Google News link is opened in
+the headless Chromium behind render_page's proxy, which stops at the first main-frame
+navigation off Google - the publisher's page is not loaded by the browser, its address is
+the result; a consent page is answered "Reject all" once per run (the N1c fixture, 11-18:
+10/10 links resolved, ~1.2 s each; plain HTTP found none). Then the publisher's robots.txt
+with the `delve-news` token (D-47 rules, a redirect to another host asked again), a plain
+GET with the honest user agent, and the text with trafilatura (15 of 16 pages >= 500
+characters; the paragraph fallback found nothing on three of them). Only a 401 / 403 / 429
+is tried once more in the browser (the fixture: 1 of 2 helped; a bot check stays a bot
+check). Under 500 characters there is no text: the story keeps its title, excerpt and
+link. An item is asked once per `try`; the backend raises it when the user asks again.
+
 ## Rejected or deferred
 
 | Option | Outcome | Reason |
