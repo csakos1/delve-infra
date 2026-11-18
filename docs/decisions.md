@@ -421,7 +421,11 @@ GET with the honest user agent, and the text with trafilatura (15 of 16 pages >=
 characters; the paragraph fallback found nothing on three of them). Only a 401 / 403 / 429
 is tried once more in the browser (the fixture: 1 of 2 helped; a bot check stays a bot
 check). Under 500 characters there is no text: the story keeps its title, excerpt and
-link. An item is asked once per `try`; the backend raises it when the user asks again.
+link. An item is asked once per `try`; the backend raises it when the user asks again. The
+worker writes each result as soon as it has it and a watchdog ends it after its budget:
+the first live run (11-18, 40 stories) hung in Playwright's WebSocket routing on a Google
+News page and lost everything at the time limit - WebSockets are no longer routed there
+(the proxy's address guard still applies), and a cut run keeps what it did.
 
 ## Rejected or deferred
 

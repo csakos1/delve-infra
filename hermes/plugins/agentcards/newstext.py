@@ -3,8 +3,13 @@
 Runs in the renderer's venv (Playwright + the system Chromium; trafilatura if installed),
 started by ``newslib.texts_main`` under the renderer's lock, never inside the gateway:
     <venv>/bin/python -I newstext.py   < {"v": 1, "budget_s": n, "items": [{id, url, gn, try}]}
-stdout: {"run_s", "browser_ms", "items": [{id, try, status, url, final_url, text, chars,
-         via, ms, error}]}
+stdout, one JSON object a line, written as soon as it is known (a cut run keeps what was
+done): {"item": {id, try, status, url, final_url, text, chars, via, ms, error}} ... and
+last {"done": {run_s, browser_ms, at, timeout}}. stderr: one progress line an item.
+
+The direct links go first, then the Google News links. A watchdog ends the run
+WATCHDOG_S after the budget even if the browser hangs (live, 11-18: a Google News page
+that kept reopening a WebSocket held the event loop; WebSockets are not routed any more).
 
 - A Google News link is opened in a headless Chromium that stops at the first main-frame
   navigation off Google: the publisher's page is never loaded by it; its address is the
@@ -29,6 +34,7 @@ import datetime as dt
 import json
 import os
 import re
+import signal
 import sys
 import time
 import urllib.parse
@@ -48,6 +54,7 @@ TEXT_CHARS = 30_000
 GN_WAIT_S = 25.0
 ROBOTS_MAX_AGE_S = 24 * 3600
 RENDER_STATUSES = (401, 403, 429)
+WATCHDOG_S = 60.0
 SKIP_TYPES = {"image", "media", "font"}
 CONSENT_BUTTON = re.compile(
     r"reject all|összes elutasítása|alle ablehnen|tout refuser|rifiuta tutto|rechazar todo", re.I)
@@ -230,9 +237,7 @@ def _one_gn(ctx: Any, url: str, PwError: Any) -> dict[str, Any]:
         except PwError:
             return None
 
-    page.route("**/*", on_route)
-    if hasattr(page, "route_web_socket"):
-        page.route_web_socket("**/*", lambda ws: ws.close())
+    page.route("**/*", on_route)  # WebSockets are not routed: see the module's doc
     res: dict[str, Any] = {"consent": False}
     clicked = False
     try:
@@ -315,55 +320,92 @@ def _rendered(url: str) -> tuple[str, str, str | None]:
     return text, f"render/{how}", None
 
 
-def run(items: list[dict[str, Any]], budget_s: float) -> dict[str, Any]:
+def run(items: list[dict[str, Any]], budget_s: float, emit: Any = None) -> dict[str, Any]:
+    """The direct links first, then the Google News ones; each result goes to ``emit`` as
+    soon as it is known. {run_s, browser_ms, items}."""
     started = time.monotonic()
     deadline = started + budget_s
-    gn_urls = [i["url"] for i in items if i.get("gn")]
-    resolved: dict[str, dict[str, Any]] = {}
-    launch_ms = None
-    if gn_urls:
-        try:
-            resolved, launch_ms = resolve_gn(gn_urls, deadline)
-        except ImportError:
-            resolved = {u: {"target": None, "error": "no playwright in this venv"}
-                        for u in gn_urls}
-        except Exception as exc:  # noqa: BLE001 - every GN item fails, the others go on
-            resolved = {u: {"target": None, "error": f"{type(exc).__name__}: {exc}"[:160]}
-                        for u in gn_urls}
-    out = []
-    for it in items:
+    done: list[dict[str, Any]] = []
+
+    def put(res: dict[str, Any]) -> None:
+        done.append(res)
+        if emit:
+            emit(res)
+
+    def one(it: dict[str, Any], url: str) -> None:
+        t0 = time.monotonic()
+        res = article(url)
+        put(dict({"id": it["id"], "try": it["try"], "url": it["url"]}, **res,
+                 ms=int((time.monotonic() - t0) * 1000)))
+
+    for it in [i for i in items if not i.get("gn")]:
         if time.monotonic() > deadline:
             break
-        t0 = time.monotonic()
-        base = {"id": it["id"], "try": it["try"], "url": it["url"]}
-        if it.get("gn"):
+        one(it, it["url"])
+    gn = [i for i in items if i.get("gn")]
+    launch_ms = None
+    if gn and time.monotonic() < deadline:
+        try:
+            resolved, launch_ms = resolve_gn([i["url"] for i in gn], deadline)
+        except ImportError:
+            resolved = {i["url"]: {"target": None, "error": "no playwright in this venv"}
+                        for i in gn}
+        except Exception as exc:  # noqa: BLE001 - every GN item fails, the others went on
+            resolved = {i["url"]: {"target": None, "error": f"{type(exc).__name__}: {exc}"[:160]}
+                        for i in gn}
+        for it in gn:
             g = resolved.get(it["url"])
-            if g is None:
+            if g is None or time.monotonic() > deadline:
                 continue                         # not reached within the budget
             if not g.get("target"):
-                out.append(dict(base, status="unresolved", final_url=None, text=None,
-                                chars=0, via=None, error=g.get("error"), ms=0))
+                put({"id": it["id"], "try": it["try"], "url": it["url"], "status": "unresolved",
+                     "final_url": None, "text": None, "chars": 0, "via": None,
+                     "error": g.get("error"), "ms": 0})
                 continue
-            res = article(g["target"])
-        else:
-            res = article(it["url"])
-        out.append(dict(base, **res, ms=int((time.monotonic() - t0) * 1000)))
+            one(it, g["target"])
     return {"run_s": round(time.monotonic() - started, 1), "browser_ms": launch_ms,
-            "items": out}
+            "items": done}
+
+
+def _line(obj: dict[str, Any]) -> None:
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def _watchdog(budget: float) -> None:
+    """After budget + WATCHDOG_S the run ends whatever hangs: the last line says so, and
+    the browser goes with the process group when this process leads it."""
+    def fire(_sig: int, _frame: Any) -> None:
+        try:
+            _line({"done": {"run_s": None, "browser_ms": None, "timeout": True,
+                            "at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")}})
+        finally:
+            if os.getpgid(0) == os.getpid():
+                os.killpg(0, signal.SIGKILL)
+            os._exit(3)
+    signal.signal(signal.SIGALRM, fire)
+    signal.alarm(int(budget + WATCHDOG_S))
 
 
 def main() -> int:
     try:
         req = json.loads(sys.stdin.read(2 * 1024 * 1024))
         items = newslib.validate_wanted({"v": 1, "items": req.get("items")})
-        budget = float(req.get("budget_s") or newslib.TEXT_BUDGET_S)
+        budget = max(1.0, min(float(req.get("budget_s") or newslib.TEXT_BUDGET_S), 900.0))
     except (ValueError, AttributeError, newslib.NewsError) as exc:
-        sys.stdout.write(json.dumps({"error": f"bad request: {exc}"[:200]}))
+        _line({"error": f"bad request: {exc}"[:200]})
         return 2
-    out = run(items, max(1.0, min(budget, 900.0)))
-    out["at"] = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
-    sys.stdout.write(json.dumps(out, ensure_ascii=False))
-    sys.stdout.flush()
+    _watchdog(budget)
+
+    def emit(res: dict[str, Any]) -> None:
+        _line({"item": res})
+        sys.stderr.write(f"{res['id']} {res['status']} {res['ms']} ms\n")
+        sys.stderr.flush()
+
+    out = run(items, budget, emit)
+    signal.alarm(0)
+    _line({"done": {"run_s": out["run_s"], "browser_ms": out["browser_ms"], "timeout": False,
+                    "at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")}})
     return 0
 
 

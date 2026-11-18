@@ -64,6 +64,7 @@ USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) DelveNews/0.1 (personal news reade
 ACCEPT_FEED = ("application/rss+xml, application/atom+xml, application/rdf+xml;q=0.9, "
                "application/xml;q=0.9, text/xml;q=0.9, */*;q=0.5")
 FETCH_TIMEOUT_S = 20
+FETCH_TOTAL_S = 45             # a whole body, however slowly it trickles in
 MAX_BYTES = 3 * 1024 * 1024
 HOST_INTERVAL_S = 2.0
 # hosts that answered parallel requests with 429 (N0b: reddit.com) get more room
@@ -280,10 +281,19 @@ def http_get(url: str, *, etag: str | None = None, modified: str | None = None,
     req = urllib.request.Request(url, headers=headers)
     try:
         with opener.open(req, timeout=FETCH_TIMEOUT_S) as r:
-            body = r.read(MAX_BYTES + 1)
-            if len(body) > MAX_BYTES:
-                raise NewsError(f"larger than {MAX_BYTES} bytes", "too_large")
-            return Response(r.status, _pick(r.headers), body, r.geturl())
+            end = time.monotonic() + FETCH_TOTAL_S
+            chunks, size = [], 0
+            while True:
+                chunk = r.read(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+                if size > MAX_BYTES:
+                    raise NewsError(f"larger than {MAX_BYTES} bytes", "too_large")
+                if time.monotonic() > end:
+                    raise NewsError(f"slower than {FETCH_TOTAL_S} s", "fetch_failed")
+            return Response(r.status, _pick(r.headers), b"".join(chunks), r.geturl())
     except urllib.error.HTTPError as exc:
         return Response(exc.code, _pick(exc.headers), None, url)
     except wl.BlockedURL:
@@ -703,8 +713,9 @@ def run_worker(items: list[dict[str, Any]], *, python: str | None = None,
                script: str | None = None, lock_path: str | None = None,
                budget_s: float = TEXT_BUDGET_S, timeout_s: float = TEXT_TIMEOUT_S,
                lock_wait_s: float = TEXT_LOCK_WAIT_S) -> dict[str, Any]:
-    """newstext.py in the renderer's venv, one run, under the renderer's lock. NewsError
-    (render_unavailable, render_busy, text_timeout, text_failed) when there is no answer."""
+    """newstext.py in the renderer's venv, one run, under the renderer's lock, in its own
+    process group (a cut run takes its browser along). NewsError (render_unavailable,
+    render_busy, text_timeout, text_failed) when there is no answer at all."""
     python = python or os.environ.get("DELVE_NEWS_TEXT_PYTHON") \
         or os.path.join(RENDER_HOME, "venv", "bin", "python")
     script = script or os.environ.get("DELVE_NEWS_TEXT_SCRIPT") or os.path.join(HERE, "newstext.py")
@@ -718,6 +729,7 @@ def run_worker(items: list[dict[str, Any]], *, python: str | None = None,
             env[k] = os.environ[k]
     os.makedirs(os.path.dirname(lock_path), mode=0o700, exist_ok=True)
     fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    cut = False
     try:
         deadline = time.monotonic() + lock_wait_s
         while True:
@@ -728,22 +740,46 @@ def run_worker(items: list[dict[str, Any]], *, python: str | None = None,
                 if time.monotonic() > deadline:
                     raise NewsError("the renderer is busy", "render_busy") from None
                 time.sleep(0.5)
-        payload = json.dumps({"v": 1, "budget_s": budget_s, "items": items})
+        payload = json.dumps({"v": 1, "budget_s": budget_s, "items": items}).encode("utf-8")
+        proc = subprocess.Popen([python, "-I", script], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+                                start_new_session=True)
         try:
-            r = subprocess.run([python, "-I", script], input=payload.encode("utf-8"),
-                               capture_output=True, timeout=timeout_s, env=env)
+            out, err = proc.communicate(payload, timeout=timeout_s)
         except subprocess.TimeoutExpired:
-            raise NewsError("the text worker took too long", "text_timeout") from None
+            cut = True
+            try:
+                os.killpg(proc.pid, 9)
+            except OSError:
+                pass
+            out, err = proc.communicate()
     finally:
         os.close(fd)
-    try:
-        out = json.loads(r.stdout.decode("utf-8", "replace"))
-        if not isinstance(out, dict) or not isinstance(out.get("items"), list):
-            raise ValueError("no items")
-    except ValueError:
-        tail = r.stderr.decode("utf-8", "replace")[-300:]
-        raise NewsError(f"the text worker gave no answer: {tail}", "text_failed") from None
-    return out
+    return _worker_answer(out, err, cut)
+
+
+def _worker_answer(out: bytes, err: bytes, cut: bool) -> dict[str, Any]:
+    """The worker's lines -> {items, run_s, browser_ms, timeout}; what was done before a cut
+    is kept. NewsError text_timeout / text_failed when there is nothing."""
+    items: list[dict[str, Any]] = []
+    done: dict[str, Any] = {}
+    for line in out.decode("utf-8", "replace").splitlines():
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and isinstance(obj.get("item"), dict):
+            items.append(obj["item"])
+        elif isinstance(obj, dict) and isinstance(obj.get("done"), dict):
+            done = obj["done"]
+    timeout = cut or bool(done.get("timeout"))
+    if not items and not done:
+        tail = " ".join(err.decode("utf-8", "replace").split())[-300:]
+        if timeout:
+            raise NewsError(f"the text worker took too long: {tail}", "text_timeout")
+        raise NewsError(f"the text worker gave no answer: {tail}", "text_failed")
+    return {"items": items, "run_s": done.get("run_s"), "browser_ms": done.get("browser_ms"),
+            "timeout": timeout}
 
 
 def write_texts(result: dict[str, Any], out_dir: str | None = None,
@@ -806,7 +842,8 @@ def texts_main(argv: list[str] | None = None) -> int:
             by[str(i.get("status"))] = by.get(str(i.get("status")), 0) + 1
         log(f"texts: {len(items)} of {len(todo)} asked ("
             + ", ".join(f"{k} {v}" for k, v in sorted(by.items()))
-            + f"), {result.get('run_s')} s")
+            + f"), {result.get('run_s')} s"
+            + (" - cut at the time limit" if result.get("timeout") else ""))
         return EXIT_OK
     finally:
         os.close(fd)

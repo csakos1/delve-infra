@@ -74,16 +74,19 @@ class Wanted(unittest.TestCase):
 
 
 FAKE_WORKER = r'''
-import json, sys
+import json, sys, time
 req = json.load(sys.stdin)
 mode = open(sys.argv[0] + ".mode").read().strip()
 if mode == "garbage":
-    print("not json"); sys.exit(1)
-items = [{"id": i["id"], "try": i["try"], "status": "ok", "url": i["url"], "final_url": i["url"],
-          "text": "x" * 600, "chars": 600, "via": "http/paragraphs", "ms": 1}
-         for i in req["items"]]
-items.append({"id": 999, "try": 1, "status": "ok"})          # never asked: dropped
-print(json.dumps({"run_s": 0.1, "browser_ms": None, "items": items}))
+    print("not json"); sys.stderr.write("Traceback: boom"); sys.exit(1)
+for n, i in enumerate(req["items"]):
+    print(json.dumps({"item": {"id": i["id"], "try": i["try"], "status": "ok", "url": i["url"],
+                               "final_url": i["url"], "text": "x" * 600, "chars": 600,
+                               "via": "http/paragraphs", "ms": 1}}), flush=True)
+    if mode == "hang":                                         # the browser hangs after one
+        time.sleep(30)
+print(json.dumps({"item": {"id": 999, "try": 1, "status": "ok"}}))   # never asked: dropped
+print(json.dumps({"done": {"run_s": 0.1, "browser_ms": None, "timeout": False}}))
 '''
 
 
@@ -142,6 +145,14 @@ class TextsRun(unittest.TestCase):
             newslib.run_worker([{"id": 1, "url": "https://a", "gn": False, "try": 1}],
                                lock_path=os.path.join(self.tmp, "lock"))
         self.assertEqual(cm.exception.code, "text_failed")
+        self.assertIn("Traceback: boom", str(cm.exception))
+
+    def test_a_cut_run_keeps_what_was_done(self):
+        self.mode("hang")
+        out = newslib.run_worker([{"id": 1, "url": "https://a", "gn": False, "try": 1},
+                                  {"id": 2, "url": "https://b", "gn": False, "try": 1}],
+                                 lock_path=os.path.join(self.tmp, "lock"), timeout_s=2)
+        self.assertEqual(([i["id"] for i in out["items"]], out["timeout"]), ([1], True))
 
     def test_busy_renderer(self):
         import fcntl
@@ -215,7 +226,12 @@ SITES = {
              "/rss/articles/B": (302, HTML, "http://consent.test/?continue=B"),
              "/articles/B2": (200, HTML, "<html><script>location.href='http://pub2.test/b'"
                                          "</script></html>"),
-             "/rss/articles/C": (200, HTML, "<html><body>nothing here</body></html>")},
+             "/rss/articles/C": (200, HTML, "<html><body>nothing here</body></html>"),
+             # live, 11-18: a page that keeps reopening a WebSocket hung the old routing
+             "/rss/articles/W": (200, HTML, "<html><script>function c(){var w=new WebSocket("
+                                 "'ws://news.test/ws');w.onclose=c}for(var n=0;n<5;n++)c();"
+                                 "setTimeout(function(){location.href='http://pub1.test/a'},800)"
+                                 "</script></html>")},
     "consent": {"/": (200, HTML, "<html><body><button onclick=\"location.href="
                                  "'http://news.test/articles/B2'\">Reject all</button>"
                                  "<button>Accept all</button></body></html>")},
@@ -288,13 +304,24 @@ class Worker(unittest.TestCase):
         sys.stdout = io.StringIO()
         try:
             self.assertEqual(newstext.main(), 0)
-            out = json.loads(sys.stdout.getvalue())
+            lines = [json.loads(ln) for ln in sys.stdout.getvalue().splitlines()]
             sys.stdin = io.StringIO('{"items": [{"id": "x"}]}')
             sys.stdout = io.StringIO()
             self.assertEqual(newstext.main(), 2)
         finally:
             sys.stdin, sys.stdout = stdin, stdout
-        self.assertEqual(out["items"][0]["status"], "ok")
+        self.assertEqual(lines[0]["item"]["status"], "ok")
+        self.assertEqual(lines[-1]["done"]["timeout"], False)
+        self.assertEqual(len(lines), 2)
+
+    def test_the_watchdog_ends_a_hung_run(self):
+        import subprocess
+        code = ("import sys, time; sys.path.insert(0, %r); import newstext; "
+                "newstext.WATCHDOG_S = 1; newstext._watchdog(0); time.sleep(20)" % PLUGIN)
+        r = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, timeout=15,
+                           start_new_session=True, env=dict(os.environ))
+        self.assertEqual(r.returncode, -9)                       # the group went, itself too
+        self.assertEqual(json.loads(r.stdout.decode().splitlines()[-1])["done"]["timeout"], True)
 
     def test_google_news(self):
         if not (_chromium() and _playwright()):
@@ -304,7 +331,8 @@ class Worker(unittest.TestCase):
         newstext.GN_WAIT_S = 3.0
         items = [{"id": 1, "url": "http://news.test/rss/articles/A", "gn": True, "try": 1},
                  {"id": 2, "url": "http://news.test/rss/articles/B", "gn": True, "try": 1},
-                 {"id": 3, "url": "http://news.test/rss/articles/C", "gn": True, "try": 1}]
+                 {"id": 3, "url": "http://news.test/rss/articles/C", "gn": True, "try": 1},
+                 {"id": 4, "url": "http://news.test/rss/articles/W", "gn": True, "try": 1}]
         pub1_before = list(self.sites["pub1"].hits)
         out = newstext.run(items, 120)
         by = {i["id"]: i for i in out["items"]}
@@ -313,6 +341,7 @@ class Worker(unittest.TestCase):
         self.assertEqual(by[2]["status"], "robots")                   # reached past consent
         self.assertEqual(by[2]["final_url"], "http://pub2.test/b")
         self.assertEqual((by[3]["status"], by[3]["error"]), ("unresolved", "no way to the publisher"))
+        self.assertEqual((by[4]["status"], by[4]["final_url"]), ("ok", "http://pub1.test/a"))
         self.assertIn("/", [p for p, _ in self.sites["consent"].hits])
         # the browser never loaded the publisher's page: only plain HTTP asked pub1
         new = self.sites["pub1"].hits[len(pub1_before):]
